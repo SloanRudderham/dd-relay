@@ -14,9 +14,13 @@ const TYPE   = process.env.TL_ENV || 'LIVE';
 const KEY    = process.env.TL_BRAND_KEY;
 const PORT   = Number(process.env.PORT || 8080);
 
-// NEW: configurable intervals (defaults = 1s)
+// Intervals (defaults = 1s)
 const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 1000);  // SSE keepalive comment
 const REFRESH_MS   = Number(process.env.REFRESH_MS   || 1000);  // periodic "latest data" push
+
+// Selection tokens (for large account lists)
+const SELECT_TTL_MS = Number(process.env.SELECT_TTL_MS || 10 * 60 * 1000); // 10 minutes
+const READ_TOKEN    = process.env.READ_TOKEN || ""; // optional read protection
 
 if (!KEY) { console.error('Missing TL_BRAND_KEY'); process.exit(1); }
 
@@ -24,6 +28,24 @@ if (!KEY) { console.error('Missing TL_BRAND_KEY'); process.exit(1); }
 // id -> { hwm, equity, maxDD, currency, updatedAt, balance? }
 const state = new Map();
 const subscribers = new Set(); // { res, filter:Set<string>, id, ping, refresh }
+const selections = new Map();  // token -> { set:Set<string>, expiresAt:number }
+
+function makeToken() {
+  return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [t, v] of selections) if (v.expiresAt <= now) selections.delete(t);
+}, 60_000);
+
+function checkToken(req, res){
+  if (!READ_TOKEN) return true;
+  const provided = String(req.query.token || req.headers['x-read-token'] || '');
+  if (provided === READ_TOKEN) return true;
+  res.status(401).json({ ok:false, error:'unauthorized' });
+  return false;
+}
+
 const num = (x)=>{ const n = parseFloat(x); return Number.isFinite(n) ? n : 0; };
 
 // try to read "balance" if the stream ever includes it
@@ -89,6 +111,13 @@ function parseAccountsParam(q){
   const raw = String(q || '').split(',').map(s=>s.trim()).filter(Boolean);
   return new Set(raw);
 }
+function getSelectionFromToken(selToken){
+  if (!selToken) return null;
+  const rec = selections.get(String(selToken));
+  if (!rec) return null;
+  rec.expiresAt = Date.now() + SELECT_TTL_MS; // refresh TTL on use
+  return rec.set; // Set<string>
+}
 function buildPayload(id){
   const s = state.get(id);
   if (!s) return null;
@@ -128,9 +157,26 @@ function pushToSubscribers(accountId){
 }
 
 // ---------------- routes ----------------
+
+// Register a selection of accounts -> returns a short token
+// POST body: { accounts:["L#526977","L#527161", ...] }
+app.post('/dd/select', (req, res) => {
+  if (!checkToken(req, res)) return;
+  const arr = Array.isArray(req.body?.accounts) ? req.body.accounts : [];
+  const set = new Set(arr.map(String).map(s=>s.trim()).filter(Boolean));
+  if (set.size === 0) return res.status(400).json({ ok:false, error:'no accounts' });
+  const token = makeToken();
+  selections.set(token, { set, expiresAt: Date.now() + SELECT_TTL_MS });
+  res.json({ ok:true, token, count: set.size, ttlMs: SELECT_TTL_MS });
+});
+
 // SSE stream (push)
 app.get('/dd/stream', (req, res) => {
-  const filter = parseAccountsParam(req.query.accounts || req.query['accounts[]']);
+  if (!checkToken(req, res)) return;
+
+  const selSet  = getSelectionFromToken(req.query.sel);
+  const paramSet= parseAccountsParam(req.query.accounts || req.query['accounts[]']);
+  const filter  = selSet ? selSet : paramSet; // prefer selection token if provided
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -170,7 +216,11 @@ app.get('/dd/stream', (req, res) => {
 
 // Snapshot (polling)
 app.get('/dd/state', (req,res) => {
-  const filter = parseAccountsParam(req.query.accounts || req.query['accounts[]']);
+  if (!checkToken(req, res)) return;
+
+  const selSet  = getSelectionFromToken(req.query.sel);
+  const filter  = selSet ? selSet : parseAccountsParam(req.query.accounts || req.query['accounts[]']);
+
   const out = [];
   for (const [id] of state.entries()){
     if (filter.size && !filter.has(id)) continue;
@@ -184,6 +234,8 @@ app.get('/dd/state', (req,res) => {
 // POST body examples:
 // {"L#526977": 480, "L#527161": 400}
 app.post('/dd/balanceSeed', (req, res) => {
+  if (!checkToken(req, res)) return;
+
   const payload = req.body;
   let updates = [];
   if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
