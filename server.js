@@ -4,7 +4,8 @@ const cors = require('cors');
 const { io } = require('socket.io-client');
 
 const app = express();
-// In prod, restrict to your Lovable domain: app.use(cors({ origin: ['https://YOUR-LOVABLE-DOMAIN'] }));
+// In production, restrict to your Lovable domain:
+// app.use(cors({ origin: ['https://YOUR-LOVABLE-DOMAIN'] }));
 app.use(cors());
 app.use(express.json());
 
@@ -14,10 +15,12 @@ const KEY    = process.env.TL_BRAND_KEY;
 const PORT   = Number(process.env.PORT || 8080);
 if (!KEY) { console.error('Missing TL_BRAND_KEY'); process.exit(1); }
 
-const state = new Map(); // id -> { hwm, equity, maxDD, currency, updatedAt }
-const subscribers = new Set(); // { res, filter:Set<string>, id, ping }
+// ---- state ----
+const state = new Map();               // id -> { hwm, equity, maxDD, currency, updatedAt }
+const subscribers = new Set();         // { res, filter:Set<string>, id, ping }
 const num = (x)=>{ const n = parseFloat(x); return Number.isFinite(n) ? n : 0; };
 
+// ---- TL BrandSocket ----
 function updateAccount(m){
   const id = m.accountId;
   const eq = num(m.equity);
@@ -43,6 +46,7 @@ socket.on('disconnect', (r) => console.log('[BrandSocket] disconnected', r));
 socket.on('error', (e) => console.error('[BrandSocket] error', e));
 socket.on('stream', (m) => { if (m?.type === 'AccountStatus') updateAccount(m); });
 
+// ---- helpers ----
 function parseAccountsParam(q){
   if (Array.isArray(q)) q = q.join(',');
   const raw = String(q || '').split(',').map(s=>s.trim()).filter(Boolean);
@@ -53,6 +57,7 @@ function buildPayload(id){
   if (!s) return null;
   const dd = s.hwm > 0 ? (s.hwm - s.equity)/s.hwm : 0;
   return {
+    type: 'account',
     accountId: id,
     equity: Number(s.equity.toFixed(2)),
     hwm: Number(s.hwm.toFixed(2)),
@@ -66,16 +71,18 @@ function buildPayload(id){
 function pushToSubscribers(accountId){
   const payload = buildPayload(accountId);
   if (!payload) return;
-  const line = `data: ${JSON.stringify({ type:'account', ...payload })}\n\n`;
+  const line = `data: ${JSON.stringify(payload)}\n\n`;
   for (const sub of subscribers){
     if (sub.filter.size && !sub.filter.has(accountId)) continue;
     sub.res.write(line);
   }
 }
 
-// SSE stream
+// ---- routes ----
+// SSE stream (push)
 app.get('/dd/stream', (req, res) => {
   const filter = parseAccountsParam(req.query.accounts || req.query['accounts[]']);
+
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache, no-transform',
@@ -85,21 +92,20 @@ app.get('/dd/stream', (req, res) => {
   res.write(`event: hello\ndata: ${JSON.stringify({ ok:true, env: TYPE })}\n\n`);
 
   const sub = { res, filter, id: Math.random().toString(36).slice(2), ping: null };
-  // heartbeat keeps proxies from closing idle connections
-  sub.ping = setInterval(() => res.write(': ping\n\n'), 25000);
+  sub.ping = setInterval(() => res.write(': ping\n\n'), 25000);   // heartbeat
   subscribers.add(sub);
 
   // initial snapshot
   const ids = filter.size ? Array.from(filter) : Array.from(state.keys());
   for (const id of ids){
     const p = buildPayload(id);
-    if (p) res.write(`data: ${JSON.stringify({ type:'account', ...p, initial:true })}\n\n`);
+    if (p) res.write(`data: ${JSON.stringify({ ...p, initial:true })}\n\n`);
   }
 
   req.on('close', () => { clearInterval(sub.ping); subscribers.delete(sub); });
 });
 
-// Snapshot
+// Snapshot (polling)
 app.get('/dd/state', (req,res) => {
   const filter = parseAccountsParam(req.query.accounts || req.query['accounts[]']);
   const out = [];
