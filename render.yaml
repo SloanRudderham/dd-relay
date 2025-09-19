@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: dd-relay
+    env: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: node server.js
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: TL_BRAND_KEY
+        sync: false
+      - key: TL_ENV
+        value: LIVE
+      - key: TL_SERVER
+        value: wss://api.tradelocker.com
