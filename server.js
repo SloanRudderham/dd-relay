@@ -16,9 +16,22 @@ const PORT   = Number(process.env.PORT || 8080);
 if (!KEY) { console.error('Missing TL_BRAND_KEY'); process.exit(1); }
 
 // ---- state ----
-const state = new Map();               // id -> { hwm, equity, maxDD, currency, updatedAt }
+// id -> { hwm, equity, maxDD, currency, updatedAt, balance? }
+const state = new Map();
 const subscribers = new Set();         // { res, filter:Set<string>, id, ping }
 const num = (x)=>{ const n = parseFloat(x); return Number.isFinite(n) ? n : 0; };
+
+// Try to read "balance" from common keys in the stream payload
+function parseBalance(m){
+  for (const k of ['balance','accountBalance','cash','cashBalance','Balance']) {
+    const v = m?.[k];
+    if (v !== undefined && v !== null && v !== '') {
+      const n = Number(v);
+      if (Number.isFinite(n)) return n;
+    }
+  }
+  return NaN;
+}
 
 // ---- TL BrandSocket ----
 function updateAccount(m){
@@ -26,12 +39,34 @@ function updateAccount(m){
   const eq = num(m.equity);
   const cur = m.currency || 'USD';
   const now = Date.now();
-  if (!state.has(id)) state.set(id, { hwm: eq, equity: eq, maxDD: 0, currency: cur, updatedAt: now });
+
+  if (!state.has(id)) {
+    state.set(id, {
+      hwm: eq,
+      equity: eq,
+      maxDD: 0,
+      currency: cur,
+      updatedAt: now,
+      balance: NaN,               // NEW: keep last seen balance
+    });
+  }
   const s = state.get(id);
+
+  // capture balance if present in this message
+  const bal = parseBalance(m);
+  if (Number.isFinite(bal)) s.balance = bal;
+
+  // lift HWM on new highs (classic drawdown baseline)
   if (eq > s.hwm) s.hwm = eq;
-  s.equity = eq; s.currency = cur; s.updatedAt = now;
+
+  s.equity = eq;
+  s.currency = cur;
+  s.updatedAt = now;
+
+  // classic DD (never negative)
   const dd = s.hwm > 0 ? (s.hwm - s.equity)/s.hwm : 0;
   if (dd > s.maxDD) s.maxDD = dd;
+
   pushToSubscribers(id);
 }
 
@@ -55,15 +90,26 @@ function parseAccountsParam(q){
 function buildPayload(id){
   const s = state.get(id);
   if (!s) return null;
+
+  // classic drawdown (from HWM)
   const dd = s.hwm > 0 ? (s.hwm - s.equity)/s.hwm : 0;
+
+  // simple signed % vs BALANCE (negative when equity < balance)
+  let instPct = null;
+  if (Number.isFinite(s.balance) && s.balance > 0) {
+    instPct = ((s.equity - s.balance) / s.balance) * 100;
+  }
+
   return {
     type: 'account',
     accountId: id,
     equity: Number(s.equity.toFixed(2)),
     hwm: Number(s.hwm.toFixed(2)),
-    dd: dd,
-    ddPct: Number((dd*100).toFixed(2)),
+    dd,                                            // fraction 0..1
+    ddPct: Number((dd*100).toFixed(2)),            // classic drawdown %
     maxDDPct: Number((s.maxDD*100).toFixed(2)),
+    balance: Number.isFinite(s.balance) ? Number(s.balance.toFixed(2)) : null,
+    instPct: instPct !== null ? Number(instPct.toFixed(2)) : null, // simple signed % vs balance
     currency: s.currency,
     updatedAt: s.updatedAt
   };
@@ -115,6 +161,24 @@ app.get('/dd/state', (req,res) => {
   }
   out.sort((a,b)=> b.equity - a.equity);
   res.json({ env: TYPE, count: out.length, accounts: out });
+});
+
+// Optional: seed balances at runtime if your stream doesn't include them
+app.post('/dd/balanceSeed', (req, res) => {
+  const payload = req.body; // { "L#526977": 480, "L#527161": 400 } OR {seeds:[{accountId,hwm}]}
+  let updates = [];
+  if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
+    for (const [accountId, bal] of Object.entries(payload)) {
+      if (!Number.isFinite(Number(bal))) continue;
+      const s = state.get(accountId) || { hwm:Number(bal), equity:Number(bal), maxDD:0, currency:'USD', updatedAt:Date.now(), balance:Number(bal) };
+      s.balance = Number(bal);
+      state.set(accountId, s);
+      updates.push({ accountId, balance: s.balance });
+      pushToSubscribers(accountId);
+    }
+  }
+  if (!updates.length) return res.status(400).json({ ok:false, error:'no valid balances' });
+  res.json({ ok:true, updates });
 });
 
 app.get('/health', (_req,res)=> res.json({ ok:true, env: TYPE, knownAccounts: state.size }));
