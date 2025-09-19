@@ -13,12 +13,17 @@ const SERVER = process.env.TL_SERVER || 'wss://api.tradelocker.com';
 const TYPE   = process.env.TL_ENV || 'LIVE';
 const KEY    = process.env.TL_BRAND_KEY;
 const PORT   = Number(process.env.PORT || 8080);
+
+// NEW: configurable intervals (defaults = 1s)
+const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 1000);  // SSE keepalive comment
+const REFRESH_MS   = Number(process.env.REFRESH_MS   || 1000);  // periodic "latest data" push
+
 if (!KEY) { console.error('Missing TL_BRAND_KEY'); process.exit(1); }
 
 // ---------------- state ----------------
 // id -> { hwm, equity, maxDD, currency, updatedAt, balance? }
 const state = new Map();
-const subscribers = new Set(); // { res, filter:Set<string>, id, ping }
+const subscribers = new Set(); // { res, filter:Set<string>, id, ping, refresh }
 const num = (x)=>{ const n = parseFloat(x); return Number.isFinite(n) ? n : 0; };
 
 // try to read "balance" if the stream ever includes it
@@ -110,13 +115,15 @@ function buildPayload(id){
     updatedAt: s.updatedAt
   };
 }
+function writePayload(res, payload){
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
 function pushToSubscribers(accountId){
   const payload = buildPayload(accountId);
   if (!payload) return;
-  const line = `data: ${JSON.stringify(payload)}\n\n`;
   for (const sub of subscribers){
     if (sub.filter.size && !sub.filter.has(accountId)) continue;
-    sub.res.write(line);
+    writePayload(sub.res, payload);
   }
 }
 
@@ -124,25 +131,41 @@ function pushToSubscribers(accountId){
 // SSE stream (push)
 app.get('/dd/stream', (req, res) => {
   const filter = parseAccountsParam(req.query.accounts || req.query['accounts[]']);
+
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache, no-transform',
     'Connection': 'keep-alive',
-    'Access-Control-Allow-Origin': '*'
+    'Access-Control-Allow-Origin': '*',
+    'X-Accel-Buffering': 'no'   // help prevent proxy buffering
   });
   res.write(`event: hello\ndata: ${JSON.stringify({ ok:true, env: TYPE })}\n\n`);
 
-  const sub = { res, filter, id: Math.random().toString(36).slice(2), ping: null };
-  sub.ping = setInterval(() => res.write(': ping\n\n'), 25000); // heartbeat for proxies
+  const sub = { res, filter, id: Math.random().toString(36).slice(2), ping: null, refresh: null };
+
+  // 1) Heartbeat every HEARTBEAT_MS (tiny SSE comment)
+  sub.ping = setInterval(() => res.write(':\n\n'), HEARTBEAT_MS);
+
+  // 2) Periodic "latest data" push every REFRESH_MS (send current snapshot)
+  const sendSnapshot = () => {
+    const ids = filter.size ? Array.from(filter) : Array.from(state.keys());
+    for (const id of ids){
+      const p = buildPayload(id);
+      if (p) writePayload(res, p);
+    }
+  };
+  if (REFRESH_MS > 0) sub.refresh = setInterval(sendSnapshot, REFRESH_MS);
+
   subscribers.add(sub);
 
-  const ids = filter.size ? Array.from(filter) : Array.from(state.keys());
-  for (const id of ids){
-    const p = buildPayload(id);
-    if (p) res.write(`data: ${JSON.stringify({ ...p, initial:true })}\n\n`);
-  }
+  // initial snapshot immediately
+  sendSnapshot();
 
-  req.on('close', () => { clearInterval(sub.ping); subscribers.delete(sub); });
+  req.on('close', () => {
+    if (sub.ping) clearInterval(sub.ping);
+    if (sub.refresh) clearInterval(sub.refresh);
+    subscribers.delete(sub);
+  });
 });
 
 // Snapshot (polling)
