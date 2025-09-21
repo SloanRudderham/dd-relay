@@ -262,20 +262,27 @@ function processPositionEvent(m){
   const p = normalizePos(m);
   if (!p.accountId || !p.positionId) return;
 
-  if (p.status === 'CLOSED') {
-    const openMap = getMap(openPos, p.accountId);
+  const openMap = getMap(openPos, p.accountId);
+
+  // Closed, zero-volume, or invalid → ensure it's not in open map
+  const shouldBeOpen = p.status === 'OPEN' && Number.isFinite(p.volume) && p.volume > 0;
+
+  if (!shouldBeOpen) {
     openMap.delete(p.positionId);
-    const arr = getArr(closedPos, p.accountId);
-    arr.unshift(p);
-    if (arr.length > 200) arr.length = 200;
+    if (p.status === 'CLOSED') {
+      const arr = getArr(closedPos, p.accountId);
+      arr.unshift(p);
+      if (arr.length > 200) arr.length = 200;
+    }
     pushPositionsUpdate(p.accountId);
-  } else {
-    const openMap = getMap(openPos, p.accountId);
-    const prev = openMap.get(p.positionId) || {};
-    // Store without mark; mark will be enriched from quotes on send
-    openMap.set(p.positionId, { ...prev, ...p });
-    pushPositionsUpdate(p.accountId);
+    return;
   }
+
+  // Valid open position → store (without static mark; enriched on send)
+  const prev = openMap.get(p.positionId) || {};
+  openMap.set(p.positionId, { ...prev, ...p });
+  pushPositionsUpdate(p.accountId);
+}
 }
 
 function touchQuote(symbol, patch){
@@ -326,8 +333,18 @@ function buildPositionsSnapshot(filter){
 
   for (const [acc, map] of openPos.entries()){
     if (!want(acc)) continue;
-    for (const p of map.values()) out.open.push(enrichPosWithQuote(p));
+    for (const p of map.values()) {
+      if (p.status === 'OPEN' && Number.isFinite(p.volume) && p.volume > 0) {
+        out.open.push(enrichPosWithQuote(p));
+      }
+    }
   }
+  for (const [acc, arr] of closedPos.entries()){
+    if (!want(acc)) continue;
+    for (const p of arr) out.closed.push(enrichPosWithQuote(p));
+  }
+  return out;
+}
   for (const [acc, arr] of closedPos.entries()){
     if (!want(acc)) continue;
     for (const p of arr) out.closed.push(enrichPosWithQuote(p));
