@@ -212,13 +212,6 @@ function normalizePos(m){
     status = 'OPEN';
   }
 
-  // Attach mark from quote cache so UI can display current
-  const q = quotes.get(symbol) || {};
-  const markMid = Number.isFinite(q.bid) && Number.isFinite(q.ask) ? (q.bid + q.ask) / 2 : (Number.isFinite(q.last) ? q.last : NaN);
-  const currentPrice = side === 'BUY'  ? (Number.isFinite(q.ask) ? q.ask : markMid)
-                      : side === 'SELL' ? (Number.isFinite(q.bid) ? q.bid : markMid)
-                      : markMid;
-
   return {
     accountId,
     positionId,
@@ -233,10 +226,24 @@ function normalizePos(m){
     uPnL: Number.isFinite(uPnL) ? uPnL : null,
     rPnL: Number.isFinite(rPnL) ? rPnL : null,
     status,
-    mark: Number.isFinite(currentPrice) ? currentPrice : null, // <-- for UI "current price"
-    quoteTime: q.time || null,
     serverTime: Date.now(),
   };
+}
+
+// Enrich positions with the freshest quote just before sending
+function enrichPosWithQuote(p) {
+  const q = quotes.get(p.symbol) || {};
+  const mid = (Number.isFinite(q.bid) && Number.isFinite(q.ask))
+    ? (q.bid + q.ask) / 2
+    : (Number.isFinite(q.last) ? q.last : null);
+
+  const mark = p.side === 'BUY'
+    ? (Number.isFinite(q.ask) ? q.ask : mid)
+    : p.side === 'SELL'
+      ? (Number.isFinite(q.bid) ? q.bid : mid)
+      : mid;
+
+  return { ...p, mark: mark ?? null, quoteTime: q.time || null };
 }
 
 function pushPositionsUpdate(accountId){
@@ -265,6 +272,7 @@ function processPositionEvent(m){
   } else {
     const openMap = getMap(openPos, p.accountId);
     const prev = openMap.get(p.positionId) || {};
+    // Store without mark; mark will be enriched from quotes on send
     openMap.set(p.positionId, { ...prev, ...p });
     pushPositionsUpdate(p.accountId);
   }
@@ -284,9 +292,7 @@ function touchQuote(symbol, patch){
   // notify subscribers
   const line = `event: quotes\ndata: ${JSON.stringify({ serverTime: now, symbol, quote: out })}\n\n`;
   for (const sub of qSubs) sub.res.write(line);
-  // also nudge positions that depend on this symbol
-  // (cheap approach: broadcast full account snapshots)
-  // If you want super fine-grained updates, track symbol->accounts map.
+  // nudge positions depending on this symbol (broadcast fresh enriched snapshot)
   for (const [acc, map] of openPos.entries()){
     for (const pos of map.values()){
       if (pos.symbol === symbol) { pushPositionsUpdate(acc); break; }
@@ -320,11 +326,11 @@ function buildPositionsSnapshot(filter){
 
   for (const [acc, map] of openPos.entries()){
     if (!want(acc)) continue;
-    for (const p of map.values()) out.open.push(p);
+    for (const p of map.values()) out.open.push(enrichPosWithQuote(p));
   }
   for (const [acc, arr] of closedPos.entries()){
     if (!want(acc)) continue;
-    out.closed.push(...arr);
+    for (const p of arr) out.closed.push(enrichPosWithQuote(p));
   }
   return out;
 }
@@ -613,7 +619,7 @@ app.get('/positions/stream', (req, res) => {
   const sub = { res, filter, ping: setInterval(()=>res.write(':\n\n'), HEARTBEAT_MS) };
   posSubs.add(sub);
 
-  // initial snapshot
+  // initial snapshot (now enriched with latest quotes)
   const snap = buildPositionsSnapshot(filter);
   res.write(`event: positions\ndata: ${JSON.stringify(snap)}\n\n`);
 
