@@ -16,8 +16,8 @@ const TYPE   = process.env.TL_ENV    || 'LIVE'; // LIVE or DEMO
 const KEY    = process.env.TL_BRAND_KEY;
 const PORT   = Number(process.env.PORT || 8080);
 
-const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 1000);  // SSE keep-alive comment
-const REFRESH_MS   = Number(process.env.REFRESH_MS   || 5000);  // periodic snapshot push
+const HEARTBEAT_MS = Number(process.env.HEARTBEAT_MS || 1000);   // SSE keep-alive comment
+const REFRESH_MS   = Number(process.env.REFRESH_MS   || 5000);   // periodic snapshot push
 const STALE_MS     = Number(process.env.STALE_MS     || 120000); // watchdog: disconnected & stale
 
 const SELECT_TTL_MS = Number(process.env.SELECT_TTL_MS || 10 * 60 * 1000);
@@ -45,6 +45,8 @@ const eventSubs = new Set();   // { res, filter:Set<string>, ping }
 // Positions caches
 const openPos   = new Map(); // accountId -> Map(positionId -> pos)
 const closedPos = new Map(); // accountId -> Array<pos>
+// Positions SSE subscribers
+const posSubs   = new Set();  // { res, filter:Set<string>, ping }
 
 const num = (x)=>{ const n = parseFloat(x); return Number.isFinite(n) ? n : 0; };
 
@@ -117,23 +119,101 @@ function getArr(map, key){
   let v = map.get(key); if (!v) { v = []; map.set(key, v); }
   return v;
 }
-function normalizePos(m){
-  const accountId  = m.accountId || m.account?.id || m.accId || m.accountID;
-  const positionId = m.positionId || m.id || m.position?.id || m.posId;
-  const symbol     = m.symbol || m.instrument || m.symbolName;
-  const volumeRaw  = m.volume ?? m.qty ?? m.quantity ?? 0;
-  const volume     = Number(volumeRaw);
-  const side       = m.side || m.direction || (volume < 0 ? 'SELL' : 'BUY');
-  const openPrice  = Number(m.openPrice ?? m.entryPrice ?? m.priceOpen ?? m.avgPrice ?? 0);
-  const closePrice = Number(m.closePrice ?? m.exitPrice ?? m.priceClose ?? 0);
-  const uPnL       = Number(m.unrealizedPnL ?? m.upnl ?? 0);
-  const rPnL       = Number(m.realizedPnL   ?? m.rpnl ?? m.pnl ?? 0);
-  const openTime   = Number(m.openTime ?? m.timeOpen ?? m.createdAt ?? m.time ?? Date.now());
-  const closeTime  = Number(m.closeTime ?? m.timeClose ?? m.closedTime ?? 0);
-  const statusRaw  = (m.status || m.state || '').toString().toUpperCase();
-  const status     = closeTime || /CLOSE|CLOSED|EXIT|FILLED/.test(statusRaw) ? 'CLOSED' : 'OPEN';
-  return { accountId, positionId, symbol, volume, side, openPrice, openTime, closePrice, closeTime, uPnL, rPnL, status, serverTime: Date.now() };
+
+// helpers for nested picking
+function n(v){ const x = Number(v); return Number.isFinite(x) ? x : NaN; }
+function first(obj, paths){
+  // paths like 'openPrice', 'position.entryPrice', 'data.position.avgPrice'
+  for (const p of paths){
+    const parts = p.split('.');
+    let cur = obj;
+    for (const k of parts){
+      if (cur && Object.prototype.hasOwnProperty.call(cur, k)) cur = cur[k];
+      else { cur = undefined; break; }
+    }
+    if (cur !== undefined && cur !== null && cur !== '') return cur;
+  }
+  return undefined;
 }
+
+// tolerant, nested-aware mapper
+function normalizePos(m){
+  // try multiple common envelopes TL brands use
+  const src = m?.position || m?.data?.position || m?.payload?.position || m;
+
+  const accountId  = String(
+    first(m,   ['accountId','account.id','accId','accountID']) ??
+    first(src, ['accountId','account.id','accId','accountID']) ?? ''
+  );
+
+  const positionId = String(
+    first(m,   ['positionId','id','position.id','posId']) ??
+    first(src, ['positionId','id','posId']) ?? ''
+  );
+
+  const symbol = String(
+    first(src, ['symbol','instrument','symbolName','s']) ??
+    first(m,   ['symbol','instrument','symbolName','s']) ?? ''
+  );
+
+  const vol =
+    n(first(src, ['volume','lots','units','size','qty','quantity','Volume'])) ??
+    n(first(m,   ['volume','lots','units','size','qty','quantity','Volume'])) ??
+    NaN;
+
+  const sideRaw =
+    (first(src, ['side','direction']) ?? first(m, ['side','direction']) ?? (vol < 0 ? 'SELL' : 'BUY'))
+      .toString().toUpperCase();
+  const side = sideRaw === 'SHORT' ? 'SELL' : sideRaw === 'LONG' ? 'BUY' : sideRaw;
+
+  const openPrice =
+    n(first(src, ['openPrice','entryPrice','openRate','avgPrice','averagePrice','priceOpen','price'])) ??
+    NaN;
+
+  const closePrice = n(first(src, ['closePrice','exitPrice','priceClose'])) ?? NaN;
+
+  const uPnL =
+    n(first(src, ['unrealizedPnL','uPnL','upnl','floatingPnL','floating','profit','pnlUnrealized'])) ?? NaN;
+
+  const rPnL =
+    n(first(src, ['realizedPnL','rPnL','rpnl','pnl'])) ?? NaN;
+
+  const openTime =
+    n(first(src, ['openTime','timeOpen','createdAt','time'])) ?? NaN;
+
+  const closeTime =
+    n(first(src, ['closeTime','timeClose','closedTime'])) ?? NaN;
+
+  // status: prefer explicit flags / type, avoid "CLOSED" when data is empty placeholder
+  const typeStr   = (m?.type || '').toString().toUpperCase();
+  const statusRaw = (first(src, ['status','state']) || first(m, ['status','state']) || '').toString().toUpperCase();
+
+  let status = 'OPEN';
+  if (closeTime || /CLOSE|CLOSED|EXIT|FILLED/.test(statusRaw) || /CLOSE|FILLED/.test(typeStr)) {
+    status = 'CLOSED';
+  }
+  // guard against bogus closed placeholders (zero volume & zero openPrice)
+  if (status === 'CLOSED' && (!Number.isFinite(vol) || vol === 0) && (!Number.isFinite(openPrice) || openPrice === 0)) {
+    status = 'OPEN';
+  }
+
+  return {
+    accountId,
+    positionId,
+    symbol,
+    volume: Number.isFinite(vol) ? vol : 0,
+    side,
+    openPrice: Number.isFinite(openPrice) ? openPrice : 0,
+    openTime: Number.isFinite(openTime) ? openTime : 0,
+    closePrice: Number.isFinite(closePrice) ? closePrice : 0,
+    closeTime: Number.isFinite(closeTime) ? closeTime : 0,
+    uPnL: Number.isFinite(uPnL) ? uPnL : 0,
+    rPnL: Number.isFinite(rPnL) ? rPnL : 0,
+    status,
+    serverTime: Date.now(),
+  };
+}
+
 function pushPositionsUpdate(accountId){
   const lineFor = (sub)=>{
     if (sub.filter.size && !sub.filter.has(accountId)) return null;
@@ -447,8 +527,6 @@ app.get('/events/stream', (req, res) => {
 });
 
 // Positions: live SSE + snapshot
-const posSubs = new Set(); // { res, filter:Set<string>, ping }
-
 app.get('/positions/stream', (req, res) => {
   if (!checkToken(req, res)) return;
   const selSet   = getSelectionFromToken(req.query.sel);
