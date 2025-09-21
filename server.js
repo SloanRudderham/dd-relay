@@ -1,4 +1,4 @@
-// server.js (fixed braces & live mark enrichment)
+// server.js — DD Relay (open positions only, live mark from quotes, fixed heartbeats)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -82,19 +82,14 @@ function first(obj, paths) {
     let cur = obj;
     for (const k of parts) {
       if (cur && Object.prototype.hasOwnProperty.call(cur, k)) cur = cur[k];
-      else {
-        cur = undefined;
-        break;
-      }
+      else { cur = undefined; break; }
     }
     if (cur !== undefined && cur !== null && cur !== '') return cur;
   }
   return undefined;
 }
 function makeToken() {
-  return (
-    Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2)
-  );
+  return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
 }
 
 setInterval(() => {
@@ -104,10 +99,7 @@ setInterval(() => {
 
 function parseAccountsParam(q) {
   if (Array.isArray(q)) q = q.join(',');
-  const raw = String(q || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const raw = String(q || '').split(',').map((s) => s.trim()).filter(Boolean);
   return new Set(raw);
 }
 function getSelectionFromToken(selToken) {
@@ -119,9 +111,7 @@ function getSelectionFromToken(selToken) {
 }
 function checkToken(req, res) {
   if (!READ_TOKEN) return true;
-  const provided = String(
-    req.query.token || req.headers['x-read-token'] || ''
-  );
+  const provided = String(req.query.token || req.headers['x-read-token'] || '');
   if (provided === READ_TOKEN) return true;
   res.status(401).json({ ok: false, error: 'unauthorized' });
   return false;
@@ -147,14 +137,7 @@ function updateAccount(m) {
   const now = Date.now();
 
   if (!state.has(id)) {
-    state.set(id, {
-      hwm: eq,
-      equity: eq,
-      maxDD: 0,
-      currency: cur,
-      updatedAt: now,
-      balance: NaN,
-    });
+    state.set(id, { hwm: eq, equity: eq, maxDD: 0, currency: cur, updatedAt: now, balance: NaN });
   }
   const s = state.get(id);
 
@@ -174,18 +157,12 @@ function updateAccount(m) {
 
 function getMap(map, key) {
   let v = map.get(key);
-  if (!v) {
-    v = new Map();
-    map.set(key, v);
-  }
+  if (!v) { v = new Map(); map.set(key, v); }
   return v;
 }
 function getArr(map, key) {
   let v = map.get(key);
-  if (!v) {
-    v = [];
-    map.set(key, v);
-  }
+  if (!v) { v = []; map.set(key, v); }
   return v;
 }
 
@@ -195,20 +172,17 @@ function normalizePos(m) {
 
   const accountId = String(
     first(m, ['accountId', 'account.id', 'accId', 'accountID']) ??
-      first(src, ['accountId', 'account.id', 'accId', 'accountID']) ??
-      ''
+    first(src, ['accountId', 'account.id', 'accId', 'accountID']) ?? ''
   );
 
   const positionId = String(
     first(m, ['positionId', 'id', 'position.id', 'posId']) ??
-      first(src, ['positionId', 'id', 'posId']) ??
-      ''
+    first(src, ['positionId', 'id', 'posId']) ?? ''
   );
 
   const symbol = String(
-    first(src, ['symbol', 'instrument', 'symbolName', 's']) ??
-      first(m, ['symbol', 'instrument', 'symbolName', 's']) ??
-      ''
+    first(src, ['symbol', 'instrument', 'symbolName', 's', 'Symbol']) ??
+    first(m, ['symbol', 'instrument', 'symbolName', 's', 'Symbol']) ?? ''
   );
 
   const vol =
@@ -217,26 +191,14 @@ function normalizePos(m) {
     NaN;
 
   const sideRaw = (
-    first(src, ['side', 'direction']) ??
-    first(m, ['side', 'direction']) ??
-    (vol < 0 ? 'SELL' : 'BUY')
-  )
-    .toString()
-    .toUpperCase();
+    first(src, ['side', 'direction']) ?? first(m, ['side', 'direction']) ?? (vol < 0 ? 'SELL' : 'BUY')
+  ).toString().toUpperCase();
   const side = sideRaw === 'SHORT' ? 'SELL' : sideRaw === 'LONG' ? 'BUY' : sideRaw;
 
   const openPrice =
-    n(
-      first(src, [
-        'openPrice',
-        'entryPrice',
-        'openRate',
-        'avgPrice',
-        'averagePrice',
-        'priceOpen',
-        'price',
-      ])
-    ) ?? n(first(m, ['openPrice', 'entryPrice', 'openRate', 'avgPrice', 'averagePrice', 'priceOpen'])) ?? NaN;
+    n(first(src, ['openPrice', 'entryPrice', 'openRate', 'avgPrice', 'averagePrice', 'priceOpen', 'price'])) ??
+    n(first(m, ['openPrice', 'entryPrice', 'openRate', 'avgPrice', 'averagePrice', 'priceOpen'])) ??
+    NaN;
 
   const closePrice = n(first(src, ['closePrice', 'exitPrice', 'priceClose'])) ?? NaN;
 
@@ -251,25 +213,14 @@ function normalizePos(m) {
     NaN;
 
   const openTime = n(first(src, ['openTime', 'timeOpen', 'createdAt', 'time', 'tOpen'])) ?? NaN;
-
   const closeTime = n(first(src, ['closeTime', 'timeClose', 'closedTime', 'tClose'])) ?? NaN;
 
   const typeStr = (m?.type || '').toString().toUpperCase();
-  const statusRaw = (first(src, ['status', 'state']) || first(m, ['status', 'state']) || '')
-    .toString()
-    .toUpperCase();
+  const statusRaw = (first(src, ['status', 'state']) || first(m, ['status', 'state']) || '').toString().toUpperCase();
   let status = 'OPEN';
-  if (closeTime || /CLOSE|CLOSED|EXIT|FILLED/.test(statusRaw) || /CLOSE|FILLED/.test(typeStr)) {
-    status = 'CLOSED';
-  }
+  if (closeTime || /CLOSE|CLOSED|EXIT|FILLED/.test(statusRaw) || /CLOSE|FILLED/.test(typeStr)) status = 'CLOSED';
   // guard placeholders
-  if (
-    status === 'CLOSED' &&
-    (!Number.isFinite(vol) || vol === 0) &&
-    (!Number.isFinite(openPrice) || openPrice === 0)
-  ) {
-    status = 'OPEN';
-  }
+  if (status === 'CLOSED' && (!Number.isFinite(vol) || vol === 0) && (!Number.isFinite(openPrice) || openPrice === 0)) status = 'OPEN';
 
   return {
     accountId,
@@ -281,7 +232,6 @@ function normalizePos(m) {
     openTime: Number.isFinite(openTime) ? openTime : 0,
     closePrice: Number.isFinite(closePrice) ? closePrice : 0,
     closeTime: Number.isFinite(closeTime) ? closeTime : 0,
-    // prefer broker uPnL if present; otherwise expose null and let UI compute if it wants
     uPnL: Number.isFinite(uPnL) ? uPnL : null,
     rPnL: Number.isFinite(rPnL) ? rPnL : null,
     status,
@@ -292,24 +242,8 @@ function normalizePos(m) {
 // Enrich positions with the freshest quote just before sending
 function enrichPosWithQuote(p) {
   const q = quotes.get(p.symbol) || {};
-  const mid =
-    Number.isFinite(q.bid) && Number.isFinite(q.ask)
-      ? (q.bid + q.ask) / 2
-      : Number.isFinite(q.last)
-      ? q.last
-      : null;
-
-  const mark =
-    p.side === 'BUY'
-      ? Number.isFinite(q.ask)
-        ? q.ask
-        : mid
-      : p.side === 'SELL'
-      ? Number.isFinite(q.bid)
-        ? q.bid
-        : mid
-      : mid;
-
+  const mid = Number.isFinite(q.bid) && Number.isFinite(q.ask) ? (q.bid + q.ask) / 2 : (Number.isFinite(q.last) ? q.last : null);
+  const mark = p.side === 'BUY' ? (Number.isFinite(q.ask) ? q.ask : mid) : (p.side === 'SELL' ? (Number.isFinite(q.bid) ? q.bid : mid) : mid);
   return { ...p, mark: mark ?? null, quoteTime: q.time || null };
 }
 
@@ -317,10 +251,7 @@ function pushPositionsUpdate(accountId) {
   const lineFor = (sub) => {
     if (sub.filter.size && !sub.filter.has(accountId)) return null;
     const snap = buildPositionsSnapshot(sub.filter, sub.openOnly !== false);
-    return `event: positions
-data: ${JSON.stringify(snap)}
-
-`;
+    return `event: positions\ndata: ${JSON.stringify(snap)}\n\n`;
   };
   for (const sub of posSubs) {
     const line = lineFor(sub);
@@ -361,23 +292,17 @@ function touchQuote(symbol, patch) {
   const out = {
     bid: Number.isFinite(patch.bid) ? patch.bid : q.bid,
     ask: Number.isFinite(patch.ask) ? patch.ask : q.ask,
-    last: Number.isFinite(patch.last) ? patch.last : Number.isFinite(patch.mid) ? patch.mid : q.last,
+    last: Number.isFinite(patch.last) ? patch.last : (Number.isFinite(patch.mid) ? patch.mid : q.last),
     time: patch.time || now,
   };
   quotes.set(symbol, out);
   // notify subscribers
-  const line = `event: quotes
-data: ${JSON.stringify({ serverTime: now, symbol, quote: out })}
-
-`;
+  const line = `event: quotes\ndata: ${JSON.stringify({ serverTime: now, symbol, quote: out })}\n\n`;
   for (const sub of qSubs) sub.res.write(line);
   // nudge positions depending on this symbol (broadcast fresh enriched snapshot)
   for (const [acc, map] of openPos.entries()) {
     for (const pos of map.values()) {
-      if (pos.symbol === symbol) {
-        pushPositionsUpdate(acc);
-        break;
-      }
+      if (pos.symbol === symbol) { pushPositionsUpdate(acc); break; }
     }
   }
 }
@@ -454,17 +379,13 @@ function pushDD(_s, accountId) {
   if (!payload) return;
   for (const sub of ddSubs) {
     if (sub.filter.size && !sub.filter.has(accountId)) continue;
-    sub.res.write(`data: ${JSON.stringify(payload)}
-
-`);
+    sub.res.write(`data: ${JSON.stringify(payload)}\n\n`);
   }
 }
 
 function broadcastEvent(m) {
   const acct = m.accountId || m.account?.id || m.accId || '';
-  const line = `data: ${JSON.stringify(m)}
-
-`;
+  const line = `data: ${JSON.stringify(m)}\n\n`;
   for (const sub of evtSubs) {
     if (sub.filter?.size && acct && !sub.filter.has(acct)) continue;
     sub.res.write(line);
@@ -493,11 +414,7 @@ socket.on('connect', () => {
 socket.on('disconnect', (reason) => console.warn('[BrandSocket] disconnected', reason));
 socket.on('connect_error', (err) => {
   lastConnectError = (err && (err.message || String(err))) || 'connect_error';
-  console.error('[BrandSocket] connect_error', lastConnectError, {
-    description: err?.description,
-    context: err?.context,
-    data: err?.data,
-  });
+  console.error('[BrandSocket] connect_error', lastConnectError, { description: err?.description, context: err?.context, data: err?.data });
 });
 socket.on('reconnect_attempt', (n) => console.log('[BrandSocket] reconnect_attempt', n));
 socket.on('reconnect', (n) => console.log('[BrandSocket] reconnected', n));
@@ -516,25 +433,12 @@ socket.on('stream', (m) => {
   }
 
   // Quotes / Ticks
-  if (
-    t.includes('QUOTE') ||
-    t.includes('TICK') ||
-    t.includes('PRIC') ||
-    t.includes('MARKET') ||
-    m?.quote ||
-    m?.data?.quote ||
-    m?.payload?.quote
-  ) {
+  if (t.includes('QUOTE') || t.includes('TICK') || t.includes('PRIC') || t.includes('MARKET') || m?.quote || m?.data?.quote || m?.payload?.quote) {
     processQuoteLikeEvent(m);
   }
 
   // Positions / Deals / Fills / Orders (some brands put PnL on order updates)
-  if (
-    t.includes('POSITION') ||
-    t.includes('DEAL') ||
-    t.includes('FILL') ||
-    t.includes('ORDER')
-  ) {
+  if (t.includes('POSITION') || t.includes('DEAL') || t.includes('FILL') || t.includes('ORDER')) {
     processPositionEvent(m);
   }
 
@@ -548,11 +452,7 @@ setInterval(() => {
   if (!socket.connected) {
     const age = Date.now() - (lastBrandEventAt || 0);
     if (age > STALE_MS) {
-      console.warn(
-        '[Watchdog] Disconnected & stale for',
-        age,
-        'ms. Exiting for platform to restart.'
-      );
+      console.warn('[Watchdog] Disconnected & stale for', age, 'ms. Exiting for platform to restart.');
       process.exit(1);
     }
   }
@@ -588,43 +488,19 @@ app.get('/dd/stream', (req, res) => {
     'Access-Control-Allow-Origin': '*',
     'X-Accel-Buffering': 'no',
   });
-  res.write(`event: hello
-data: ${JSON.stringify({ ok: true, env: TYPE })}
+  res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, env: TYPE })}\n\n`);
 
-`);
-
-  const sub = {
-    res,
-    filter,
-    id: Math.random().toString(36).slice(2),
-    ping: null,
-    refresh: null,
-  };
-  sub.ping = setInterval(() => res.write(':
-
-'), HEARTBEAT_MS);
+  const sub = { res, filter, id: Math.random().toString(36).slice(2), ping: null, refresh: null };
+  sub.ping = setInterval(() => res.write(`: ping\n\n`), HEARTBEAT_MS);
 
   const sendSnapshot = () => {
     const ids = filter.size ? Array.from(filter) : Array.from(state.keys());
     if (batchMode) {
       const arr = [];
-      for (const id of ids) {
-        const p = buildDDPayload(id);
-        if (p) arr.push(p);
-      }
-      res.write(
-        `event: batch
-data: ${JSON.stringify({ serverTime: Date.now(), accounts: arr })}
-
-`
-      );
+      for (const id of ids) { const p = buildDDPayload(id); if (p) arr.push(p); }
+      res.write(`event: batch\ndata: ${JSON.stringify({ serverTime: Date.now(), accounts: arr })}\n\n`);
     } else {
-      for (const id of ids) {
-        const p = buildDDPayload(id);
-        if (p) res.write(`data: ${JSON.stringify(p)}
-
-`);
-      }
+      for (const id of ids) { const p = buildDDPayload(id); if (p) res.write(`data: ${JSON.stringify(p)}\n\n`); }
     }
   };
   if (REFRESH_MS > 0) sub.refresh = setInterval(sendSnapshot, REFRESH_MS);
@@ -649,8 +525,7 @@ app.get('/dd/state', (req, res) => {
   const out = [];
   for (const [id] of state.entries()) {
     if (filter.size && !filter.has(id)) continue;
-    const p = buildDDPayload(id);
-    if (p) out.push(p);
+    const p = buildDDPayload(id); if (p) out.push(p);
   }
   out.sort((a, b) => b.equity - a.equity);
   res.json({ env: TYPE, count: out.length, accounts: out });
@@ -665,23 +540,8 @@ app.get('/dd/coverage', (req, res) => {
   const expected = selSet.size;
   let present = 0;
   const missing = [];
-  for (const id of selSet) {
-    if (state.has(id)) present++;
-    else missing.push(id);
-  }
-  res.json({
-    ok: true,
-    env: TYPE,
-    connected: socket.connected,
-    selectionCount: expected,
-    present,
-    missingCount: missing.length,
-    missing,
-    knownAccounts: state.size,
-    lastBrandEventAt,
-    lastConnectError,
-    now: Date.now(),
-  });
+  for (const id of selSet) { if (state.has(id)) present++; else missing.push(id); }
+  res.json({ ok: true, env: TYPE, connected: socket.connected, selectionCount: expected, present, missingCount: missing.length, missing, knownAccounts: state.size, lastBrandEventAt, lastConnectError, now: Date.now() });
 });
 
 // Seed balances at runtime if the stream doesn't include them
@@ -693,28 +553,18 @@ app.post('/dd/balanceSeed', (req, res) => {
   let updates = [];
   if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
     for (const [accountId, bal] of Object.entries(payload)) {
-      const n = Number(bal);
-      if (!Number.isFinite(n)) continue;
+      const nVal = Number(bal);
+      if (!Number.isFinite(nVal)) continue;
       const now = Date.now();
-      const s =
-        state.get(accountId) ||
-        {
-          hwm: n,
-          equity: n,
-          maxDD: 0,
-          currency: 'USD',
-          updatedAt: now,
-          balance: n,
-        };
-      s.balance = n;
+      const s = state.get(accountId) || { hwm: nVal, equity: nVal, maxDD: 0, currency: 'USD', updatedAt: now, balance: nVal };
+      s.balance = nVal;
       s.updatedAt = now;
       state.set(accountId, s);
       updates.push({ accountId, balance: s.balance });
       pushDD(s, accountId);
     }
   }
-  if (!updates.length)
-    return res.status(400).json({ ok: false, error: 'no valid balances' });
+  if (!updates.length) return res.status(400).json({ ok: false, error: 'no valid balances' });
   res.json({ ok: true, updates });
 });
 
@@ -725,26 +575,12 @@ app.get('/events/stream', (req, res) => {
   const paramSet = parseAccountsParam(req.query.accounts || req.query['accounts[]']);
   const filter = selSet ? selSet : paramSet;
 
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache, no-transform',
-    Connection: 'keep-alive',
-    'Access-Control-Allow-Origin': '*',
-    'X-Accel-Buffering': 'no',
-  });
-  res.write(`event: hello
-data: ${JSON.stringify({ ok: true, env: TYPE })}
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'Access-Control-Allow-Origin': '*', 'X-Accel-Buffering': 'no' });
+  res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, env: TYPE })}\n\n`);
 
-`);
-
-  const sub = { res, filter, ping: setInterval(() => res.write(':
-
-'), HEARTBEAT_MS) };
+  const sub = { res, filter, ping: setInterval(() => res.write(`: ping\n\n`), HEARTBEAT_MS) };
   evtSubs.add(sub);
-  req.on('close', () => {
-    clearInterval(sub.ping);
-    evtSubs.delete(sub);
-  });
+  req.on('close', () => { clearInterval(sub.ping); evtSubs.delete(sub); });
 });
 
 // ---------- Positions SSE + Snapshot ----------
@@ -755,34 +591,17 @@ app.get('/positions/stream', (req, res) => {
   const filter = selSet ? selSet : paramSet;
   const openOnly = String(req.query.openOnly || '1') !== '0';
 
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache, no-transform',
-    Connection: 'keep-alive',
-    'Access-Control-Allow-Origin': '*',
-    'X-Accel-Buffering': 'no',
-  });
-  res.write(`event: hello
-data: ${JSON.stringify({ ok: true, env: TYPE })}
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'Access-Control-Allow-Origin': '*', 'X-Accel-Buffering': 'no' });
+  res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, env: TYPE })}\n\n`);
 
-`);
-
-  const sub = { res, filter, openOnly, ping: setInterval(() => res.write(':
-
-'), HEARTBEAT_MS) };
+  const sub = { res, filter, openOnly, ping: setInterval(() => res.write(`: ping\n\n`), HEARTBEAT_MS) };
   posSubs.add(sub);
 
   // initial snapshot (now enriched with latest quotes)
   const snap = buildPositionsSnapshot(filter, openOnly);
-  res.write(`event: positions
-data: ${JSON.stringify(snap)}
+  res.write(`event: positions\ndata: ${JSON.stringify(snap)}\n\n`);
 
-`);
-
-  req.on('close', () => {
-    clearInterval(sub.ping);
-    posSubs.delete(sub);
-  });
+  req.on('close', () => { clearInterval(sub.ping); posSubs.delete(sub); });
 });
 
 app.get('/positions/state', (req, res) => {
@@ -796,66 +615,32 @@ app.get('/positions/state', (req, res) => {
 // ---------- Quotes SSE + Snapshot ----------
 app.get('/quotes/stream', (req, res) => {
   if (!checkToken(req, res)) return;
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache, no-transform',
-    Connection: 'keep-alive',
-    'Access-Control-Allow-Origin': '*',
-    'X-Accel-Buffering': 'no',
-  });
-  res.write(`event: hello
-data: ${JSON.stringify({ ok: true, env: TYPE })}
+  res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'Access-Control-Allow-Origin': '*', 'X-Accel-Buffering': 'no' });
+  res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, env: TYPE })}\n\n`);
 
-`);
-
-  const sub = { res, ping: setInterval(() => res.write(':
-
-'), HEARTBEAT_MS) };
+  const sub = { res, ping: setInterval(() => res.write(`: ping\n\n`), HEARTBEAT_MS) };
   qSubs.add(sub);
 
   // initial snapshot
-  const all = {};
-  for (const [s, q] of quotes.entries()) all[s] = q;
-  res.write(`event: quotes
-data: ${JSON.stringify({ serverTime: Date.now(), all })}
+  const all = {}; for (const [s, q] of quotes.entries()) all[s] = q;
+  res.write(`event: quotes\ndata: ${JSON.stringify({ serverTime: Date.now(), all })}\n\n`);
 
-`);
-
-  req.on('close', () => {
-    clearInterval(sub.ping);
-    qSubs.delete(sub);
-  });
+  req.on('close', () => { clearInterval(sub.ping); qSubs.delete(sub); });
 });
 
 app.get('/quotes/state', (req, res) => {
   if (!checkToken(req, res)) return;
-  const out = {};
-  for (const [s, q] of quotes.entries()) out[s] = q;
+  const out = {}; for (const [s, q] of quotes.entries()) out[s] = q;
   res.json({ serverTime: Date.now(), count: Object.keys(out).length, quotes: out });
 });
 
 // ---------- Health ----------
-app.get('/health', (_req, res) =>
-  res.json({ ok: true, env: TYPE, knownAccounts: state.size })
-);
-app.get('/brand/status', (_req, res) =>
-  res.json({
-    env: TYPE,
-    server: SERVER,
-    connected: socket.connected,
-    knownAccounts: state.size,
-    lastBrandEventAt,
-    lastConnectError,
-    now: Date.now(),
-  })
-);
+app.get('/health', (_req, res) => res.json({ ok: true, env: TYPE, knownAccounts: state.size }));
+app.get('/brand/status', (_req, res) => res.json({ env: TYPE, server: SERVER, connected: socket.connected, knownAccounts: state.size, lastBrandEventAt, lastConnectError, now: Date.now() }));
 
 // ---------- Hardening ----------
 process.on('unhandledRejection', (r) => console.error('[unhandledRejection]', r));
-process.on('uncaughtException', (e) => {
-  console.error('[uncaughtException]', e);
-  process.exit(1);
-});
+process.on('uncaughtException', (e) => { console.error('[uncaughtException]', e); process.exit(1); });
 
 // ---------- Start ----------
 app.listen(PORT, () => console.log(`DD relay listening on :${PORT}`));
