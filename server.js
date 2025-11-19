@@ -1,4 +1,4 @@
-// server.js — DD Relay (accounts only: equity/HWM/DD/balance)
+// server.js — DD Relay (accounts + open positions)
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -30,8 +30,11 @@ if (TYPE !== 'LIVE' && /api\.tradelocker\.com/.test(SERVER)) {
 }
 
 // ---------- State ----------
-/** id -> { hwm, equity, maxDD, currency, updatedAt, balance? } */
+/** accountId -> { hwm, equity, maxDD, currency, updatedAt, balance?, positionPnLs? } */
 const state = new Map();
+
+/** accountId -> Map<positionId, positionData> */
+const positions = new Map();
 
 /** token -> { set:Set<string>, expiresAt:number } */
 const selections = new Map();
@@ -122,7 +125,57 @@ function updateAccount(m){
   const dd = s.hwm > 0 ? (s.hwm - s.equity) / s.hwm : 0; // 0..1
   if (dd > s.maxDD) s.maxDD = dd;
 
+  // Store positionPnLs from AccountStatus
+  if (m.positionPnLs && Array.isArray(m.positionPnLs)) {
+    s.positionPnLs = m.positionPnLs;
+  }
+
   pushDD(s, id);
+}
+
+// ---------- Position handling ----------
+function updatePosition(m){
+  const accountId = m.accountId;
+  const positionId = m.positionId;
+  
+  if (!accountId || !positionId) return;
+
+  // Ensure positions map exists for this account
+  if (!positions.has(accountId)) {
+    positions.set(accountId, new Map());
+  }
+
+  const accountPositions = positions.get(accountId);
+  
+  // Store or update position
+  accountPositions.set(positionId, {
+    positionId,
+    accountId,
+    lots: m.lots,
+    lotSize: m.lotSize,
+    units: m.units,
+    instrument: m.instrument,
+    openPrice: m.openPrice,
+    openDateTime: m.openDateTime,
+    openOrderId: m.openOrderId,
+    stopLossOrderId: m.stopLossOrderId,
+    stopLossLimit: m.stopLossLimit,
+    maintMargin: m.maintMargin,
+    takeProfitOrderId: m.takeProfitOrderId,
+    takeProfitLimit: m.takeProfitLimit,
+    side: m.side,
+    fee: m.fee,
+    swaps: m.swaps,
+    updatedAt: Date.now(),
+  });
+}
+
+function removePosition(accountId, positionId){
+  if (!accountId || !positionId) return;
+  const accountPositions = positions.get(accountId);
+  if (accountPositions) {
+    accountPositions.delete(positionId);
+  }
 }
 
 function buildDDPayload(id){
@@ -134,6 +187,25 @@ function buildDDPayload(id){
   let instPct = null; // signed % vs balance
   if (Number.isFinite(s.balance) && s.balance > 0) {
     instPct = ((s.equity - s.balance) / s.balance) * 100;
+  }
+
+  // Get open positions for this account
+  const accountPositions = positions.get(id);
+  const openPositions = accountPositions ? Array.from(accountPositions.values()) : [];
+
+  // Merge P&L from AccountStatus into positions
+  if (s.positionPnLs && Array.isArray(s.positionPnLs)) {
+    const pnlMap = new Map();
+    s.positionPnLs.forEach(p => {
+      pnlMap.set(p.positionId, num(p.pnl));
+    });
+
+    // Inject P&L into each position
+    openPositions.forEach(pos => {
+      if (pnlMap.has(pos.positionId)) {
+        pos.pnl = pnlMap.get(pos.positionId);
+      }
+    });
   }
 
   return {
@@ -149,6 +221,8 @@ function buildDDPayload(id){
     currency: s.currency,
     updatedAt: s.updatedAt,
     serverTime: Date.now(),
+    openPositions, // Include positions array
+    positionPnLs: s.positionPnLs, // Include raw P&L data
   };
 }
 
@@ -204,9 +278,19 @@ socket.on('stream', (m) => {
   lastBrandEventAt = Date.now();
   const t = (m?.type || '').toString().toUpperCase();
 
-  // Accounts only
+  // Handle account updates
   if (t === 'ACCOUNTSTATUS' || t === 'ACCOUNT' || t === 'ACCOUNT_UPDATE') {
     updateAccount(m);
+  }
+
+  // Handle position updates
+  if (t === 'POSITION') {
+    updatePosition(m);
+  }
+
+  // Handle closed positions
+  if (t === 'CLOSEPOSITION') {
+    removePosition(m.accountId, m.positionId);
   }
 
   // pass-through for debugging/consumption
@@ -239,7 +323,7 @@ app.post('/dd/select', (req, res) => {
   res.json({ ok:true, token, count: set.size, ttlMs: SELECT_TTL_MS });
 });
 
-// Drawdown SSE (accounts only)
+// Drawdown SSE (accounts + positions)
 app.get('/dd/stream', (req, res) => {
   if (!checkToken(req, res)) return;
 
@@ -314,6 +398,14 @@ app.get('/dd/coverage', (req, res) => {
     if (state.has(id)) present++;
     else missing.push(id);
   }
+  
+  // Count total positions
+  let totalPositions = 0;
+  for (const [accountId] of positions) {
+    if (filter.size && !filter.has(accountId)) continue;
+    totalPositions += positions.get(accountId).size;
+  }
+  
   res.json({
     ok: true,
     env: TYPE,
@@ -323,6 +415,7 @@ app.get('/dd/coverage', (req, res) => {
     missingCount: missing.length,
     missing,
     knownAccounts: state.size,
+    totalPositions,
     lastBrandEventAt,
     lastConnectError,
     now: Date.now(),
@@ -375,20 +468,31 @@ app.get('/events/stream', (req, res) => {
 });
 
 // Health & status
-app.get('/health', (_req,res)=> res.json({ ok:true, env: TYPE, knownAccounts: state.size }));
-app.get('/brand/status', (_req,res)=> res.json({
-  env: TYPE,
-  server: SERVER,
-  connected: socket.connected,
-  knownAccounts: state.size,
-  lastBrandEventAt,
-  lastConnectError,
-  now: Date.now(),
-}));
+app.get('/health', (_req,res)=> {
+  let totalPositions = 0;
+  for (const posMap of positions.values()) totalPositions += posMap.size;
+  res.json({ ok:true, env: TYPE, knownAccounts: state.size, totalPositions });
+});
+
+app.get('/brand/status', (_req,res)=> {
+  let totalPositions = 0;
+  for (const posMap of positions.values()) totalPositions += posMap.size;
+  
+  res.json({
+    env: TYPE,
+    server: SERVER,
+    connected: socket.connected,
+    knownAccounts: state.size,
+    totalPositions,
+    lastBrandEventAt,
+    lastConnectError,
+    now: Date.now(),
+  });
+});
 
 // Hardening
 process.on('unhandledRejection', (r) => console.error('[unhandledRejection]', r));
 process.on('uncaughtException', (e) => { console.error('[uncaughtException]', e); process.exit(1); });
 
 // Start
-app.listen(PORT, ()=> console.log(`DD relay (accounts only) listening on :${PORT}`));
+app.listen(PORT, ()=> console.log(`DD relay (accounts + positions) listening on :${PORT}`));
