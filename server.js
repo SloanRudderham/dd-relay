@@ -20,6 +20,20 @@ const STALE_MS      = Number(process.env.STALE_MS     || 120000); // watchdog
 const SELECT_TTL_MS = Number(process.env.SELECT_TTL_MS || 10 * 60 * 1000);
 const READ_TOKEN    = process.env.READ_TOKEN || ''; // optional read protection
 
+// --- Hotfix guardrails (minimal, safe defaults) ---
+const MAX_STREAMS_PER_IP = Number(process.env.MAX_STREAMS_PER_IP || 5);
+
+// Caps for batch snapshots when filter is empty or abusive clients request too much
+const MAX_ACCOUNTS = Number(process.env.MAX_ACCOUNTS || 1000);
+
+// Default batch cap (~2MB). If exceeded, we will degrade by dropping heavy fields (positions/pnls)
+// based on include flags instead of crashing the process.
+const MAX_BATCH_BYTES = Number(process.env.MAX_BATCH_BYTES || 2_000_000);
+
+// Prevent "zombie positions" accumulating forever if CLOSEPOSITION is missed
+const POSITION_TTL_MS = Number(process.env.POSITION_TTL_MS || 10 * 60 * 1000);
+const PRUNE_POSITIONS_MS = Number(process.env.PRUNE_POSITIONS_MS || 60 * 1000);
+
 if (!KEY) { console.error('Missing TL_BRAND_KEY'); process.exit(1); }
 
 if (TYPE === 'LIVE' && /api-dev/.test(SERVER)) {
@@ -40,11 +54,23 @@ const positions = new Map();
 const selections = new Map();
 
 /** SSE subscribers (drawdown & raw events) */
-const ddSubs  = new Set(); // { res, filter:Set<string>, ping, refresh }
+const ddSubs  = new Set(); // { res, filter:Set<string>, ping, refresh, includePositions, includeRawPnls, id }
 const evtSubs = new Set(); // { res, filter:Set<string>, ping }
 
 let lastBrandEventAt = 0;
 let lastConnectError = '';
+
+// --- Stream limiting (per IP) ---
+const streamsByIp = new Map();
+function getIp(req) {
+  return String((req.headers['x-forwarded-for'] || '').split(',')[0] || req.ip || '').trim();
+}
+function incIp(ip) { streamsByIp.set(ip, (streamsByIp.get(ip) || 0) + 1); }
+function decIp(ip) {
+  const n = (streamsByIp.get(ip) || 1) - 1;
+  if (n <= 0) streamsByIp.delete(ip);
+  else streamsByIp.set(ip, n);
+}
 
 // ---------- Utils ----------
 const num = (x)=>{ const n = parseFloat(x); return Number.isFinite(n) ? n : 0; };
@@ -64,10 +90,36 @@ function first(obj, paths){
 
 function makeToken(){ return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2); }
 
+// --- Backpressure-safe write (prevents buffering death spirals) ---
+async function safeWrite(res, chunk) {
+  try {
+    const ok = res.write(chunk);
+    if (!ok) await new Promise(resolve => res.once('drain', resolve));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// prune selection tokens
 setInterval(() => {
   const now = Date.now();
   for (const [t, v] of selections) if (v.expiresAt <= now) selections.delete(t);
 }, 60_000);
+
+// prune stale positions (prevents openPositions growing without bound)
+setInterval(() => {
+  const now = Date.now();
+  for (const [accountId, posMap] of positions) {
+    for (const [positionId, pos] of posMap) {
+      const updatedAt = Number(pos?.updatedAt || 0);
+      if (updatedAt && (now - updatedAt > POSITION_TTL_MS)) {
+        posMap.delete(positionId);
+      }
+    }
+    if (posMap.size === 0) positions.delete(accountId);
+  }
+}, PRUNE_POSITIONS_MS);
 
 function parseAccountsParam(q){
   if (Array.isArray(q)) q = q.join(',');
@@ -137,7 +189,7 @@ function updateAccount(m){
 function updatePosition(m){
   const accountId = m.accountId;
   const positionId = m.positionId;
-  
+
   if (!accountId || !positionId) return;
 
   // Ensure positions map exists for this account
@@ -146,7 +198,7 @@ function updatePosition(m){
   }
 
   const accountPositions = positions.get(accountId);
-  
+
   // Store or update position
   accountPositions.set(positionId, {
     positionId,
@@ -175,12 +227,16 @@ function removePosition(accountId, positionId){
   const accountPositions = positions.get(accountId);
   if (accountPositions) {
     accountPositions.delete(positionId);
+    if (accountPositions.size === 0) positions.delete(accountId);
   }
 }
 
-function buildDDPayload(id){
+function buildDDPayload(id, opts = {}) {
   const s = state.get(id);
   if (!s) return null;
+
+  const includePositions = opts.includePositions !== undefined ? !!opts.includePositions : false;
+  const includeRawPnls   = opts.includeRawPnls   !== undefined ? !!opts.includeRawPnls   : false;
 
   const dd = s.hwm > 0 ? (s.hwm - s.equity) / s.hwm : 0;
 
@@ -189,23 +245,20 @@ function buildDDPayload(id){
     instPct = ((s.equity - s.balance) / s.balance) * 100;
   }
 
-  // Get open positions for this account
-  const accountPositions = positions.get(id);
-  const openPositions = accountPositions ? Array.from(accountPositions.values()) : [];
+  let openPositions;
+  if (includePositions) {
+    const accountPositions = positions.get(id);
+    openPositions = accountPositions ? Array.from(accountPositions.values()) : [];
 
-  // Merge P&L from AccountStatus into positions
-  if (s.positionPnLs && Array.isArray(s.positionPnLs)) {
-    const pnlMap = new Map();
-    s.positionPnLs.forEach(p => {
-      pnlMap.set(p.positionId, num(p.pnl));
-    });
+    // Merge P&L from AccountStatus into positions
+    if (s.positionPnLs && Array.isArray(s.positionPnLs)) {
+      const pnlMap = new Map();
+      s.positionPnLs.forEach(p => pnlMap.set(p.positionId, num(p.pnl)));
 
-    // Inject P&L into each position
-    openPositions.forEach(pos => {
-      if (pnlMap.has(pos.positionId)) {
-        pos.pnl = pnlMap.get(pos.positionId);
-      }
-    });
+      openPositions.forEach(pos => {
+        if (pnlMap.has(pos.positionId)) pos.pnl = pnlMap.get(pos.positionId);
+      });
+    }
   }
 
   return {
@@ -221,26 +274,43 @@ function buildDDPayload(id){
     currency: s.currency,
     updatedAt: s.updatedAt,
     serverTime: Date.now(),
-    openPositions, // Include positions array
-    positionPnLs: s.positionPnLs, // Include raw P&L data
+    ...(includePositions ? { openPositions } : {}),
+    ...(includeRawPnls ? { positionPnLs: s.positionPnLs } : {}),
   };
 }
 
+// Per-account delta push (only used by non-batch consumers; keep it working)
 function pushDD(_s, accountId){
-  const payload = buildDDPayload(accountId);
+  const payload = buildDDPayload(accountId, { includePositions: true, includeRawPnls: true });
   if (!payload) return;
-  for (const sub of ddSubs){
+
+  for (const sub of Array.from(ddSubs)){
     if (sub.filter.size && !sub.filter.has(accountId)) continue;
-    sub.res.write(`data: ${JSON.stringify(payload)}\n\n`);
+
+    safeWrite(sub.res, `data: ${JSON.stringify(payload)}\n\n`).then(ok => {
+      if (!ok) {
+        try { if (sub.ping) clearInterval(sub.ping); if (sub.refresh) clearInterval(sub.refresh); } catch {}
+        ddSubs.delete(sub);
+        try { sub.res.end(); } catch {}
+      }
+    });
   }
 }
 
 function broadcastEvent(m){
   const acct = m.accountId || m.account?.id || m.accId || '';
   const line = `data: ${JSON.stringify(m)}\n\n`;
-  for (const sub of evtSubs){
+
+  for (const sub of Array.from(evtSubs)){
     if (sub.filter?.size && acct && !sub.filter.has(acct)) continue;
-    sub.res.write(line);
+
+    safeWrite(sub.res, line).then(ok => {
+      if (!ok) {
+        try { if (sub.ping) clearInterval(sub.ping); } catch {}
+        evtSubs.delete(sub);
+        try { sub.res.end(); } catch {}
+      }
+    });
   }
 }
 
@@ -327,10 +397,24 @@ app.post('/dd/select', (req, res) => {
 app.get('/dd/stream', (req, res) => {
   if (!checkToken(req, res)) return;
 
+  // --- Per-IP stream limiting ---
+  const ip = getIp(req);
+  if ((streamsByIp.get(ip) || 0) >= MAX_STREAMS_PER_IP) {
+    return res.status(429).send('Too many streams from this IP');
+  }
+  incIp(ip);
+
   const selSet   = getSelectionFromToken(req.query.sel);
   const paramSet = parseAccountsParam(req.query.accounts || req.query['accounts[]']);
   const filter   = selSet ? selSet : paramSet;
-  const batchMode= req.query.batch === '1';
+
+  const batchMode = req.query.batch === '1';
+
+  // Minimal contract-compatible optimization:
+  // - default is LIGHT (no positions/pnls) so all your existing non-exposure pages stop pulling huge payloads
+  // - Exposure pages opt-in via includePositions=1&includeRawPnls=1
+  const includePositions = req.query.includePositions === '1';
+  const includeRawPnls   = req.query.includeRawPnls === '1';
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -339,37 +423,119 @@ app.get('/dd/stream', (req, res) => {
     'Access-Control-Allow-Origin': '*',
     'X-Accel-Buffering': 'no',
   });
-  res.write(`event: hello\ndata: ${JSON.stringify({ ok:true, env: TYPE })}\n\n`);
 
-  const sub = { res, filter, id: Math.random().toString(36).slice(2), ping: null, refresh: null };
-  sub.ping = setInterval(() => res.write(`: ping\n\n`), HEARTBEAT_MS);
+  safeWrite(res, `event: hello\ndata: ${JSON.stringify({ ok:true, env: TYPE })}\n\n`);
 
-  const sendSnapshot = () => {
-    const ids = filter.size ? Array.from(filter) : Array.from(state.keys());
+  const sub = {
+    res,
+    filter,
+    includePositions,
+    includeRawPnls,
+    id: Math.random().toString(36).slice(2),
+    ping: null,
+    refresh: null
+  };
+
+  sub.ping = setInterval(() => {
+    safeWrite(res, `: ping\n\n`).then(ok => {
+      if (!ok) {
+        try { req.destroy(); } catch {}
+      }
+    });
+  }, HEARTBEAT_MS);
+
+  // snapshot builder with graceful degradation when payload explodes
+  const buildAccountsSnapshot = () => {
+    const idsAll = filter.size ? Array.from(filter) : Array.from(state.keys());
+    const ids = idsAll.slice(0, MAX_ACCOUNTS);
+
+    const accounts = [];
+    let bytes = 0;
+    let truncated = false;
+
+    for (const id of ids) {
+      // Start with requested fields
+      let p = buildDDPayload(id, { includePositions, includeRawPnls });
+      if (!p) continue;
+
+      let s = JSON.stringify(p);
+      let nextBytes = bytes + Buffer.byteLength(s, 'utf8');
+
+      // If we are over cap and we included heavy fields, degrade for this account only:
+      if (nextBytes > MAX_BATCH_BYTES && (includePositions || includeRawPnls)) {
+        // drop raw pnls first (often large)
+        p = buildDDPayload(id, { includePositions, includeRawPnls: false });
+        s = JSON.stringify(p);
+        nextBytes = bytes + Buffer.byteLength(s, 'utf8');
+      }
+      if (nextBytes > MAX_BATCH_BYTES && includePositions) {
+        // then drop positions too
+        p = buildDDPayload(id, { includePositions: false, includeRawPnls: false });
+        s = JSON.stringify(p);
+        nextBytes = bytes + Buffer.byteLength(s, 'utf8');
+      }
+
+      // If still too big, stop adding accounts to avoid runaway (keep contract: full snapshot of what we can)
+      if (nextBytes > MAX_BATCH_BYTES) {
+        truncated = true;
+        break;
+      }
+
+      bytes = nextBytes;
+      accounts.push(p);
+    }
+
+    if (accounts.length < ids.length) truncated = true;
+
+    return { accounts, truncated, bytes, requestedAccounts: ids.length };
+  };
+
+  const sendSnapshot = async () => {
     if (batchMode) {
-      const arr = [];
-      for (const id of ids) { const p = buildDDPayload(id); if (p) arr.push(p); }
-      res.write(`event: batch\ndata: ${JSON.stringify({ serverTime: Date.now(), accounts: arr })}\n\n`);
+      const snap = buildAccountsSnapshot();
+      const payload = {
+        serverTime: Date.now(),
+        env: TYPE,
+        truncated: snap.truncated,
+        bytes: snap.bytes,
+        requestedAccounts: snap.requestedAccounts,
+        accounts: snap.accounts,
+      };
+      await safeWrite(res, `event: batch\ndata: ${JSON.stringify(payload)}\n\n`);
     } else {
-      for (const id of ids){
-        const p = buildDDPayload(id);
-        if (p) res.write(`data: ${JSON.stringify(p)}\n\n`);
+      // legacy non-batch behavior: send per-account messages
+      const idsAll = filter.size ? Array.from(filter) : Array.from(state.keys());
+      const ids = idsAll.slice(0, MAX_ACCOUNTS);
+
+      for (const id of ids) {
+        const p = buildDDPayload(id, { includePositions, includeRawPnls });
+        if (!p) continue;
+        const ok = await safeWrite(res, `data: ${JSON.stringify(p)}\n\n`);
+        if (!ok) break;
       }
     }
   };
-  if (REFRESH_MS > 0) sub.refresh = setInterval(sendSnapshot, REFRESH_MS);
+
+  // Repeated snapshots: required by your UI
+  if (REFRESH_MS > 0) {
+    sub.refresh = setInterval(() => { sendSnapshot(); }, REFRESH_MS);
+  }
 
   ddSubs.add(sub);
   sendSnapshot();
 
-  req.on('close', () => {
-    if (sub.ping)    clearInterval(sub.ping);
+  const cleanup = () => {
+    decIp(ip);
+    if (sub.ping) clearInterval(sub.ping);
     if (sub.refresh) clearInterval(sub.refresh);
     ddSubs.delete(sub);
-  });
+  };
+
+  req.on('close', cleanup);
+  req.on('aborted', cleanup);
 });
 
-// Drawdown snapshot (JSON)
+// Drawdown snapshot (JSON) — unchanged output (light default would break callers; keep full)
 app.get('/dd/state', (req, res) => {
   if (!checkToken(req, res)) return;
 
@@ -379,7 +545,8 @@ app.get('/dd/state', (req, res) => {
   const out = [];
   for (const [id] of state.entries()){
     if (filter.size && !filter.has(id)) continue;
-    const p = buildDDPayload(id); if (p) out.push(p);
+    const p = buildDDPayload(id, { includePositions:true, includeRawPnls:true });
+    if (p) out.push(p);
   }
   out.sort((a,b)=> b.equity - a.equity);
   res.json({ env: TYPE, count: out.length, accounts: out });
@@ -388,8 +555,11 @@ app.get('/dd/state', (req, res) => {
 // Coverage for a selection token
 app.get('/dd/coverage', (req, res) => {
   if (!checkToken(req, res)) return;
+
   const selSet = getSelectionFromToken(req.query.sel);
   if (!selSet) return res.status(400).json({ ok:false, error:'bad or expired selection token' });
+
+  const filter = selSet; // FIX: filter was undefined in original code
 
   const expected = selSet.size;
   let present = 0;
@@ -398,14 +568,14 @@ app.get('/dd/coverage', (req, res) => {
     if (state.has(id)) present++;
     else missing.push(id);
   }
-  
-  // Count total positions
+
+  // Count total positions (filtered)
   let totalPositions = 0;
-  for (const [accountId] of positions) {
+  for (const [accountId, posMap] of positions) {
     if (filter.size && !filter.has(accountId)) continue;
-    totalPositions += positions.get(accountId).size;
+    totalPositions += posMap.size;
   }
-  
+
   res.json({
     ok: true,
     env: TYPE,
@@ -449,6 +619,14 @@ app.post('/dd/balanceSeed', (req, res) => {
 // Raw events SSE (optional debugging)
 app.get('/events/stream', (req, res) => {
   if (!checkToken(req, res)) return;
+
+  // --- Per-IP stream limiting ---
+  const ip = getIp(req);
+  if ((streamsByIp.get(ip) || 0) >= MAX_STREAMS_PER_IP) {
+    return res.status(429).send('Too many streams from this IP');
+  }
+  incIp(ip);
+
   const selSet   = getSelectionFromToken(req.query.sel);
   const paramSet = parseAccountsParam(req.query.accounts || req.query['accounts[]']);
   const filter   = selSet ? selSet : paramSet;
@@ -460,11 +638,30 @@ app.get('/events/stream', (req, res) => {
     'Access-Control-Allow-Origin': '*',
     'X-Accel-Buffering': 'no',
   });
-  res.write(`event: hello\ndata: ${JSON.stringify({ ok:true, env: TYPE })}\n\n`);
 
-  const sub = { res, filter, ping: setInterval(() => res.write(`: ping\n\n`), HEARTBEAT_MS) };
+  safeWrite(res, `event: hello\ndata: ${JSON.stringify({ ok:true, env: TYPE })}\n\n`);
+
+  const sub = {
+    res,
+    filter,
+    ping: setInterval(() => {
+      safeWrite(res, `: ping\n\n`).then(ok => {
+        if (!ok) {
+          try { req.destroy(); } catch {}
+        }
+      });
+    }, HEARTBEAT_MS)
+  };
+
   evtSubs.add(sub);
-  req.on('close', () => { clearInterval(sub.ping); evtSubs.delete(sub); });
+
+  const cleanup = () => {
+    decIp(ip);
+    clearInterval(sub.ping);
+    evtSubs.delete(sub);
+  };
+  req.on('close', cleanup);
+  req.on('aborted', cleanup);
 });
 
 // Health & status
@@ -477,7 +674,7 @@ app.get('/health', (_req,res)=> {
 app.get('/brand/status', (_req,res)=> {
   let totalPositions = 0;
   for (const posMap of positions.values()) totalPositions += posMap.size;
-  
+
   res.json({
     env: TYPE,
     server: SERVER,
