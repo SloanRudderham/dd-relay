@@ -44,14 +44,7 @@ if (TYPE !== 'LIVE' && /api\.tradelocker\.com/.test(SERVER)) {
 }
 
 // ---------- State ----------
-/**
- * accountId -> {
- *   hwm, equity, maxDD, currency, updatedAt,
- *   balance?, balanceWithoutCredit?, credit?,
- *   marginAvailable?, marginUsed?, blockedBalance?,
- *   positionPnLs?
- * }
- */
+/** accountId -> { hwm, equity, maxDD, currency, updatedAt, balance?, positionPnLs? } */
 const state = new Map();
 
 /** accountId -> Map<positionId, positionData> */
@@ -150,25 +143,14 @@ function checkToken(req, res){
 
 // ---------- Account handling ----------
 function parseBalance(m){
-  // Prefer balanceWithoutCredit when present (matches Brand API semantics)
-  for (const k of ['balanceWithoutCredit','balance_without_credit','balanceWithoutCreditAmount','BalanceWithoutCredit']) {
-    const v = m?.[k];
-    if (v !== undefined && v !== null && v !== '') {
-      const n = Number(v);
-      if (Number.isFinite(n)) return { value: n, kind: 'withoutCredit' };
-    }
-  }
-
-  // Fallback to regular balance
   for (const k of ['balance','accountBalance','cash','cashBalance','Balance']) {
     const v = m?.[k];
     if (v !== undefined && v !== null && v !== '') {
       const n = Number(v);
-      if (Number.isFinite(n)) return { value: n, kind: 'withCreditOrUnknown' };
+      if (Number.isFinite(n)) return n;
     }
   }
-
-  return { value: NaN, kind: 'unknown' };
+  return NaN;
 }
 
 function updateAccount(m){
@@ -180,60 +162,13 @@ function updateAccount(m){
   const now = Date.now();
 
   if (!state.has(id)) {
-    state.set(id, {
-      hwm: eq,
-      equity: eq,
-      maxDD: 0,
-      currency: cur,
-      updatedAt: now,
-      balance: NaN,
-      balanceWithoutCredit: NaN,
-      credit: NaN,
-      marginAvailable: NaN,
-      marginUsed: NaN,
-      blockedBalance: NaN,
-      positionPnLs: undefined,
-    });
+    state.set(id, { hwm:eq, equity:eq, maxDD:0, currency:cur, updatedAt:now, balance: NaN });
   }
   const s = state.get(id);
 
-  // Balance + balanceWithoutCredit
-  const balRec = parseBalance(m);
-  if (Number.isFinite(balRec.value)) {
-    if (balRec.kind === 'withoutCredit') {
-      s.balanceWithoutCredit = balRec.value;
-      // Keep s.balance as-is unless a separate balance field is also provided
-      const balWith = first(m, ['balance','accountBalance','cash','cashBalance','Balance']);
-      const balWithNum = Number(balWith);
-      if (Number.isFinite(balWithNum)) s.balance = balWithNum;
-    } else {
-      s.balance = balRec.value;
-    }
-  }
+  const bal = parseBalance(m);
+  if (Number.isFinite(bal)) s.balance = bal;
 
-  // Credit
-  {
-    const credit = first(m, ['credit','Credit']);
-    const n = Number(credit);
-    if (Number.isFinite(n)) s.credit = n;
-  }
-
-  // Margin + blocked
-  {
-    const marginAvailable = first(m, ['marginAvailable','margin_available','freeMargin','MarginAvailable']);
-    const marginUsed      = first(m, ['marginUsed','margin_used','usedMargin','MarginUsed']);
-    const blockedBalance  = first(m, ['blockedBalance','blocked_balance','BlockedBalance']);
-
-    const ma = Number(marginAvailable);
-    const mu = Number(marginUsed);
-    const bb = Number(blockedBalance);
-
-    if (Number.isFinite(ma)) s.marginAvailable = ma;
-    if (Number.isFinite(mu)) s.marginUsed = mu;
-    if (Number.isFinite(bb)) s.blockedBalance = bb;
-  }
-
-  // HWM/DD logic unchanged
   if (eq > s.hwm) s.hwm = eq;      // raise HWM
   s.equity = eq;
   s.currency = cur;
@@ -305,14 +240,9 @@ function buildDDPayload(id, opts = {}) {
 
   const dd = s.hwm > 0 ? (s.hwm - s.equity) / s.hwm : 0;
 
-  // Use balanceWithoutCredit (preferred) for instantaneous PnL% if available; otherwise fall back to balance
-  const baseBal = (Number.isFinite(s.balanceWithoutCredit) && s.balanceWithoutCredit > 0)
-    ? s.balanceWithoutCredit
-    : (Number.isFinite(s.balance) && s.balance > 0 ? s.balance : NaN);
-
-  let instPct = null; // signed % vs base balance
-  if (Number.isFinite(baseBal) && baseBal > 0) {
-    instPct = ((s.equity - baseBal) / baseBal) * 100;
+  let instPct = null; // signed % vs balance
+  if (Number.isFinite(s.balance) && s.balance > 0) {
+    instPct = ((s.equity - s.balance) / s.balance) * 100;
   }
 
   let openPositions;
@@ -334,29 +264,16 @@ function buildDDPayload(id, opts = {}) {
   return {
     type: 'account',
     accountId: id,
-
     equity: Number(s.equity.toFixed(2)),
     hwm: Number(s.hwm.toFixed(2)),
-
     dd,
     ddPct: Number((dd * 100).toFixed(2)),
     maxDDPct: Number((s.maxDD * 100).toFixed(2)),
-
-    // AccountStatus fields (now forwarded)
     balance: Number.isFinite(s.balance) ? Number(s.balance.toFixed(2)) : null,
-    balanceWithoutCredit: Number.isFinite(s.balanceWithoutCredit) ? Number(s.balanceWithoutCredit.toFixed(2)) : null,
-    credit: Number.isFinite(s.credit) ? Number(s.credit.toFixed(2)) : null,
-    marginAvailable: Number.isFinite(s.marginAvailable) ? Number(s.marginAvailable.toFixed(2)) : null,
-    marginUsed: Number.isFinite(s.marginUsed) ? Number(s.marginUsed.toFixed(2)) : null,
-    blockedBalance: Number.isFinite(s.blockedBalance) ? Number(s.blockedBalance.toFixed(2)) : null,
-
-    // Derived
     instPct: instPct !== null ? Number(instPct.toFixed(2)) : null,
-
     currency: s.currency,
     updatedAt: s.updatedAt,
     serverTime: Date.now(),
-
     ...(includePositions ? { openPositions } : {}),
     ...(includeRawPnls ? { positionPnLs: s.positionPnLs } : {}),
   };
@@ -687,19 +604,7 @@ app.post('/dd/balanceSeed', (req, res) => {
       const nVal = Number(bal);
       if (!Number.isFinite(nVal)) continue;
       const now = Date.now();
-      const s = state.get(accountId) || {
-        hwm:nVal,
-        equity:nVal,
-        maxDD:0,
-        currency:'USD',
-        updatedAt: now,
-        balance:nVal,
-        balanceWithoutCredit: NaN,
-        credit: NaN,
-        marginAvailable: NaN,
-        marginUsed: NaN,
-        blockedBalance: NaN,
-      };
+      const s = state.get(accountId) || { hwm:nVal, equity:nVal, maxDD:0, currency:'USD', updatedAt: now, balance:nVal };
       s.balance = nVal;
       s.updatedAt = now;
       state.set(accountId, s);
