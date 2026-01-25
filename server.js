@@ -1,5 +1,7 @@
 // server.js — DD Relay (accounts + open positions)
+
 require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
 const { io } = require('socket.io-client');
@@ -13,7 +15,6 @@ const SERVER = process.env.TL_SERVER || 'wss://api.tradelocker.com';
 const TYPE   = process.env.TL_ENV    || 'LIVE'; // LIVE or DEMO
 const KEY    = process.env.TL_BRAND_KEY;
 const PORT   = Number(process.env.PORT || 8080);
-
 const HEARTBEAT_MS  = Number(process.env.HEARTBEAT_MS || 1000);   // SSE keep-alive
 const REFRESH_MS    = Number(process.env.REFRESH_MS   || 5000);   // periodic push
 const STALE_MS      = Number(process.env.STALE_MS     || 120000); // watchdog
@@ -22,20 +23,12 @@ const READ_TOKEN    = process.env.READ_TOKEN || ''; // optional read protection
 
 // --- Hotfix guardrails (minimal, safe defaults) ---
 const MAX_STREAMS_PER_IP = Number(process.env.MAX_STREAMS_PER_IP || 5);
-
-// Caps for batch snapshots when filter is empty or abusive clients request too much
 const MAX_ACCOUNTS = Number(process.env.MAX_ACCOUNTS || 1000);
-
-// Default batch cap (~2MB). If exceeded, we will degrade by dropping heavy fields (positions/pnls)
-// based on include flags instead of crashing the process.
 const MAX_BATCH_BYTES = Number(process.env.MAX_BATCH_BYTES || 2_000_000);
-
-// Prevent "zombie positions" accumulating forever if CLOSEPOSITION is missed
 const POSITION_TTL_MS = Number(process.env.POSITION_TTL_MS || 10 * 60 * 1000);
 const PRUNE_POSITIONS_MS = Number(process.env.PRUNE_POSITIONS_MS || 60 * 1000);
 
 if (!KEY) { console.error('Missing TL_BRAND_KEY'); process.exit(1); }
-
 if (TYPE === 'LIVE' && /api-dev/.test(SERVER)) {
   console.warn('[Config] TL_ENV=LIVE but TL_SERVER looks DEV:', SERVER);
 }
@@ -44,24 +37,21 @@ if (TYPE !== 'LIVE' && /api\.tradelocker\.com/.test(SERVER)) {
 }
 
 // ---------- State ----------
-/** accountId -> { hwm, equity, maxDD, currency, updatedAt, balance?, positionPnLs? } */
 const state = new Map();
-
-/** accountId -> Map<positionId, positionData> */
 const positions = new Map();
-
-/** token -> { set:Set<string>, expiresAt:number } */
 const selections = new Map();
 
-/** SSE subscribers (drawdown & raw events) */
-const ddSubs  = new Set(); // { res, filter:Set<string>, ping, refresh, includePositions, includeRawPnls, id }
-const evtSubs = new Set(); // { res, filter:Set<string>, ping }
+/** SSE subscribers */
+const ddSubs  = new Set();
+const evtSubs = new Set();
+const posSubs = new Set(); // NEW: Position stream subscribers
 
 let lastBrandEventAt = 0;
 let lastConnectError = '';
 
 // --- Stream limiting (per IP) ---
 const streamsByIp = new Map();
+
 function getIp(req) {
   return String((req.headers['x-forwarded-for'] || '').split(',')[0] || req.ip || '').trim();
 }
@@ -90,7 +80,6 @@ function first(obj, paths){
 
 function makeToken(){ return Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2); }
 
-// --- Backpressure-safe write (prevents buffering death spirals) ---
 async function safeWrite(res, chunk) {
   try {
     const ok = res.write(chunk);
@@ -107,7 +96,7 @@ setInterval(() => {
   for (const [t, v] of selections) if (v.expiresAt <= now) selections.delete(t);
 }, 60_000);
 
-// prune stale positions (prevents openPositions growing without bound)
+// prune stale positions
 setInterval(() => {
   const now = Date.now();
   for (const [accountId, posMap] of positions) {
@@ -126,13 +115,15 @@ function parseAccountsParam(q){
   const raw = String(q || '').split(',').map(s=>s.trim()).filter(Boolean);
   return new Set(raw);
 }
+
 function getSelectionFromToken(selToken){
   if (!selToken) return null;
   const rec = selections.get(String(selToken));
   if (!rec) return null;
-  rec.expiresAt = Date.now() + SELECT_TTL_MS; // refresh TTL on use
+  rec.expiresAt = Date.now() + SELECT_TTL_MS;
   return rec.set;
 }
+
 function checkToken(req, res){
   if (!READ_TOKEN) return true;
   const provided = String(req.query.token || req.headers['x-read-token'] || '');
@@ -156,32 +147,24 @@ function parseBalance(m){
 function updateAccount(m){
   const id  = m.accountId || m.account?.id || m.accId || String(m?.accountID || '');
   if (!id) return;
-
   const eq  = num(m.equity ?? m.Equity);
   const cur = m.currency || m.Currency || 'USD';
   const now = Date.now();
-
   if (!state.has(id)) {
     state.set(id, { hwm:eq, equity:eq, maxDD:0, currency:cur, updatedAt:now, balance: NaN });
   }
   const s = state.get(id);
-
   const bal = parseBalance(m);
   if (Number.isFinite(bal)) s.balance = bal;
-
-  if (eq > s.hwm) s.hwm = eq;      // raise HWM
+  if (eq > s.hwm) s.hwm = eq;
   s.equity = eq;
   s.currency = cur;
   s.updatedAt = now;
-
-  const dd = s.hwm > 0 ? (s.hwm - s.equity) / s.hwm : 0; // 0..1
+  const dd = s.hwm > 0 ? (s.hwm - s.equity) / s.hwm : 0;
   if (dd > s.maxDD) s.maxDD = dd;
-
-  // Store positionPnLs from AccountStatus
   if (m.positionPnLs && Array.isArray(m.positionPnLs)) {
     s.positionPnLs = m.positionPnLs;
   }
-
   pushDD(s, id);
 }
 
@@ -189,17 +172,11 @@ function updateAccount(m){
 function updatePosition(m){
   const accountId = m.accountId;
   const positionId = m.positionId;
-
   if (!accountId || !positionId) return;
-
-  // Ensure positions map exists for this account
   if (!positions.has(accountId)) {
     positions.set(accountId, new Map());
   }
-
   const accountPositions = positions.get(accountId);
-
-  // Store or update position
   accountPositions.set(positionId, {
     positionId,
     accountId,
@@ -234,33 +211,25 @@ function removePosition(accountId, positionId){
 function buildDDPayload(id, opts = {}) {
   const s = state.get(id);
   if (!s) return null;
-
   const includePositions = opts.includePositions !== undefined ? !!opts.includePositions : false;
   const includeRawPnls   = opts.includeRawPnls   !== undefined ? !!opts.includeRawPnls   : false;
-
   const dd = s.hwm > 0 ? (s.hwm - s.equity) / s.hwm : 0;
-
-  let instPct = null; // signed % vs balance
+  let instPct = null;
   if (Number.isFinite(s.balance) && s.balance > 0) {
     instPct = ((s.equity - s.balance) / s.balance) * 100;
   }
-
   let openPositions;
   if (includePositions) {
     const accountPositions = positions.get(id);
     openPositions = accountPositions ? Array.from(accountPositions.values()) : [];
-
-    // Merge P&L from AccountStatus into positions
     if (s.positionPnLs && Array.isArray(s.positionPnLs)) {
       const pnlMap = new Map();
       s.positionPnLs.forEach(p => pnlMap.set(p.positionId, num(p.pnl)));
-
       openPositions.forEach(pos => {
         if (pnlMap.has(pos.positionId)) pos.pnl = pnlMap.get(pos.positionId);
       });
     }
   }
-
   return {
     type: 'account',
     accountId: id,
@@ -279,14 +248,11 @@ function buildDDPayload(id, opts = {}) {
   };
 }
 
-// Per-account delta push (only used by non-batch consumers; keep it working)
 function pushDD(_s, accountId){
   const payload = buildDDPayload(accountId, { includePositions: true, includeRawPnls: true });
   if (!payload) return;
-
   for (const sub of Array.from(ddSubs)){
     if (sub.filter.size && !sub.filter.has(accountId)) continue;
-
     safeWrite(sub.res, `data: ${JSON.stringify(payload)}\n\n`).then(ok => {
       if (!ok) {
         try { if (sub.ping) clearInterval(sub.ping); if (sub.refresh) clearInterval(sub.refresh); } catch {}
@@ -300,14 +266,29 @@ function pushDD(_s, accountId){
 function broadcastEvent(m){
   const acct = m.accountId || m.account?.id || m.accId || '';
   const line = `data: ${JSON.stringify(m)}\n\n`;
-
   for (const sub of Array.from(evtSubs)){
     if (sub.filter?.size && acct && !sub.filter.has(acct)) continue;
-
     safeWrite(sub.res, line).then(ok => {
       if (!ok) {
         try { if (sub.ping) clearInterval(sub.ping); } catch {}
         evtSubs.delete(sub);
+        try { sub.res.end(); } catch {}
+      }
+    });
+  }
+}
+
+// NEW: Broadcast position events to /stream/positions subscribers
+function broadcastPositionEvent(eventType, accountId, data) {
+  const payload = { type: eventType, accountId, ...data, serverTime: Date.now() };
+  const line = `data: ${JSON.stringify(payload)}\n\n`;
+  
+  for (const sub of Array.from(posSubs)) {
+    if (sub.filter?.size && !sub.filter.has(accountId)) continue;
+    safeWrite(sub.res, line).then(ok => {
+      if (!ok) {
+        try { if (sub.ping) clearInterval(sub.ping); } catch {}
+        posSubs.delete(sub);
         try { sub.res.end(); } catch {}
       }
     });
@@ -353,21 +334,45 @@ socket.on('stream', (m) => {
     updateAccount(m);
   }
 
-  // Handle position updates
+  // Handle position updates - also broadcast to position stream
   if (t === 'POSITION') {
     updatePosition(m);
+    // NEW: Broadcast to /stream/positions subscribers
+    broadcastPositionEvent('position', m.accountId, {
+      position: {
+        positionId: m.positionId,
+        instrument: m.instrument,
+        side: m.side,
+        volume: m.lots,
+        lots: m.lots,
+        lotSize: m.lotSize,
+        openPrice: m.openPrice,
+        openTime: m.openDateTime,
+        openDateTime: m.openDateTime,
+        stopLoss: m.stopLossLimit,
+        takeProfit: m.takeProfitLimit,
+      }
+    });
   }
 
-  // Handle closed positions
+  // Handle closed positions - also broadcast to position stream
   if (t === 'CLOSEPOSITION') {
     removePosition(m.accountId, m.positionId);
+    // NEW: Broadcast to /stream/positions subscribers
+    broadcastPositionEvent('positionClosed', m.accountId, {
+      positionId: m.positionId,
+      closePrice: m.closePrice,
+      closeTime: m.closeDateTime || Date.now(),
+      profit: m.profit,
+      netProfit: m.netProfit,
+    });
   }
 
   // pass-through for debugging/consumption
   broadcastEvent(m);
 });
 
-// Watchdog: only restart if DISCONNECTED and stale
+// Watchdog
 setInterval(() => {
   if (!STALE_MS) return;
   if (!socket.connected) {
@@ -381,8 +386,7 @@ setInterval(() => {
 
 // ---------- Routes ----------
 
-// Register a selection of accounts -> returns a short token
-// POST body: { accounts:["L#526977","L#527161", ...] }
+// Register a selection of accounts
 app.post('/dd/select', (req, res) => {
   if (!checkToken(req, res)) return;
   const arr = Array.isArray(req.body?.accounts) ? req.body.accounts : [];
@@ -396,8 +400,6 @@ app.post('/dd/select', (req, res) => {
 // Drawdown SSE (accounts + positions)
 app.get('/dd/stream', (req, res) => {
   if (!checkToken(req, res)) return;
-
-  // --- Per-IP stream limiting ---
   const ip = getIp(req);
   if ((streamsByIp.get(ip) || 0) >= MAX_STREAMS_PER_IP) {
     return res.status(429).send('Too many streams from this IP');
@@ -407,12 +409,7 @@ app.get('/dd/stream', (req, res) => {
   const selSet   = getSelectionFromToken(req.query.sel);
   const paramSet = parseAccountsParam(req.query.accounts || req.query['accounts[]']);
   const filter   = selSet ? selSet : paramSet;
-
   const batchMode = req.query.batch === '1';
-
-  // Minimal contract-compatible optimization:
-  // - default is LIGHT (no positions/pnls) so all your existing non-exposure pages stop pulling huge payloads
-  // - Exposure pages opt-in via includePositions=1&includeRawPnls=1
   const includePositions = req.query.includePositions === '1';
   const includeRawPnls   = req.query.includeRawPnls === '1';
 
@@ -438,55 +435,39 @@ app.get('/dd/stream', (req, res) => {
 
   sub.ping = setInterval(() => {
     safeWrite(res, `: ping\n\n`).then(ok => {
-      if (!ok) {
-        try { req.destroy(); } catch {}
-      }
+      if (!ok) { try { req.destroy(); } catch {} }
     });
   }, HEARTBEAT_MS);
 
-  // snapshot builder with graceful degradation when payload explodes
   const buildAccountsSnapshot = () => {
     const idsAll = filter.size ? Array.from(filter) : Array.from(state.keys());
     const ids = idsAll.slice(0, MAX_ACCOUNTS);
-
     const accounts = [];
     let bytes = 0;
     let truncated = false;
-
     for (const id of ids) {
-      // Start with requested fields
       let p = buildDDPayload(id, { includePositions, includeRawPnls });
       if (!p) continue;
-
       let s = JSON.stringify(p);
       let nextBytes = bytes + Buffer.byteLength(s, 'utf8');
-
-      // If we are over cap and we included heavy fields, degrade for this account only:
       if (nextBytes > MAX_BATCH_BYTES && (includePositions || includeRawPnls)) {
-        // drop raw pnls first (often large)
         p = buildDDPayload(id, { includePositions, includeRawPnls: false });
         s = JSON.stringify(p);
         nextBytes = bytes + Buffer.byteLength(s, 'utf8');
       }
       if (nextBytes > MAX_BATCH_BYTES && includePositions) {
-        // then drop positions too
         p = buildDDPayload(id, { includePositions: false, includeRawPnls: false });
         s = JSON.stringify(p);
         nextBytes = bytes + Buffer.byteLength(s, 'utf8');
       }
-
-      // If still too big, stop adding accounts to avoid runaway (keep contract: full snapshot of what we can)
       if (nextBytes > MAX_BATCH_BYTES) {
         truncated = true;
         break;
       }
-
       bytes = nextBytes;
       accounts.push(p);
     }
-
     if (accounts.length < ids.length) truncated = true;
-
     return { accounts, truncated, bytes, requestedAccounts: ids.length };
   };
 
@@ -503,10 +484,8 @@ app.get('/dd/stream', (req, res) => {
       };
       await safeWrite(res, `event: batch\ndata: ${JSON.stringify(payload)}\n\n`);
     } else {
-      // legacy non-batch behavior: send per-account messages
       const idsAll = filter.size ? Array.from(filter) : Array.from(state.keys());
       const ids = idsAll.slice(0, MAX_ACCOUNTS);
-
       for (const id of ids) {
         const p = buildDDPayload(id, { includePositions, includeRawPnls });
         if (!p) continue;
@@ -516,7 +495,6 @@ app.get('/dd/stream', (req, res) => {
     }
   };
 
-  // Repeated snapshots: required by your UI
   if (REFRESH_MS > 0) {
     sub.refresh = setInterval(() => { sendSnapshot(); }, REFRESH_MS);
   }
@@ -530,18 +508,94 @@ app.get('/dd/stream', (req, res) => {
     if (sub.refresh) clearInterval(sub.refresh);
     ddSubs.delete(sub);
   };
-
   req.on('close', cleanup);
   req.on('aborted', cleanup);
 });
 
-// Drawdown snapshot (JSON) — unchanged output (light default would break callers; keep full)
+// NEW: Position events SSE stream (for copy trading real-time detection)
+app.get('/stream/positions', (req, res) => {
+  if (!checkToken(req, res)) return;
+  
+  const ip = getIp(req);
+  if ((streamsByIp.get(ip) || 0) >= MAX_STREAMS_PER_IP) {
+    return res.status(429).send('Too many streams from this IP');
+  }
+  incIp(ip);
+
+  const selSet   = getSelectionFromToken(req.query.sel);
+  const paramSet = parseAccountsParam(req.query.accounts || req.query['accounts[]']);
+  const filter   = selSet ? selSet : paramSet;
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': '*',
+    'X-Accel-Buffering': 'no',
+  });
+
+  safeWrite(res, `event: hello\ndata: ${JSON.stringify({ ok:true, env: TYPE, endpoint: 'positions' })}\n\n`);
+
+  // Send initial snapshot of open positions for filtered accounts
+  const sendInitialPositions = async () => {
+    const idsAll = filter.size ? Array.from(filter) : Array.from(positions.keys());
+    for (const accountId of idsAll) {
+      const accountPositions = positions.get(accountId);
+      if (!accountPositions) continue;
+      for (const pos of accountPositions.values()) {
+        const payload = {
+          type: 'position',
+          accountId,
+          position: {
+            positionId: pos.positionId,
+            instrument: pos.instrument,
+            side: pos.side,
+            volume: pos.lots,
+            lots: pos.lots,
+            lotSize: pos.lotSize,
+            openPrice: pos.openPrice,
+            openTime: pos.openDateTime,
+            openDateTime: pos.openDateTime,
+            stopLoss: pos.stopLossLimit,
+            takeProfit: pos.takeProfitLimit,
+          },
+          serverTime: Date.now(),
+          isSnapshot: true,
+        };
+        await safeWrite(res, `data: ${JSON.stringify(payload)}\n\n`);
+      }
+    }
+    // Signal snapshot complete
+    await safeWrite(res, `event: snapshot_complete\ndata: ${JSON.stringify({ ok: true, serverTime: Date.now() })}\n\n`);
+  };
+
+  const sub = {
+    res,
+    filter,
+    ping: setInterval(() => {
+      safeWrite(res, `: ping\n\n`).then(ok => {
+        if (!ok) { try { req.destroy(); } catch {} }
+      });
+    }, HEARTBEAT_MS)
+  };
+
+  posSubs.add(sub);
+  sendInitialPositions();
+
+  const cleanup = () => {
+    decIp(ip);
+    clearInterval(sub.ping);
+    posSubs.delete(sub);
+  };
+  req.on('close', cleanup);
+  req.on('aborted', cleanup);
+});
+
+// Drawdown snapshot (JSON)
 app.get('/dd/state', (req, res) => {
   if (!checkToken(req, res)) return;
-
   const selSet  = getSelectionFromToken(req.query.sel);
   const filter  = selSet ? selSet : parseAccountsParam(req.query.accounts || req.query['accounts[]']);
-
   const out = [];
   for (const [id] of state.entries()){
     if (filter.size && !filter.has(id)) continue;
@@ -555,12 +609,9 @@ app.get('/dd/state', (req, res) => {
 // Coverage for a selection token
 app.get('/dd/coverage', (req, res) => {
   if (!checkToken(req, res)) return;
-
   const selSet = getSelectionFromToken(req.query.sel);
   if (!selSet) return res.status(400).json({ ok:false, error:'bad or expired selection token' });
-
-  const filter = selSet; // FIX: filter was undefined in original code
-
+  const filter = selSet;
   const expected = selSet.size;
   let present = 0;
   const missing = [];
@@ -568,14 +619,11 @@ app.get('/dd/coverage', (req, res) => {
     if (state.has(id)) present++;
     else missing.push(id);
   }
-
-  // Count total positions (filtered)
   let totalPositions = 0;
   for (const [accountId, posMap] of positions) {
     if (filter.size && !filter.has(accountId)) continue;
     totalPositions += posMap.size;
   }
-
   res.json({
     ok: true,
     env: TYPE,
@@ -592,11 +640,9 @@ app.get('/dd/coverage', (req, res) => {
   });
 });
 
-// Seed balances manually if stream lacks them
-// POST body: {"L#526977": 480, "L#527161": 400}
+// Seed balances manually
 app.post('/dd/balanceSeed', (req, res) => {
   if (!checkToken(req, res)) return;
-
   const payload = req.body;
   let updates = [];
   if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
@@ -616,11 +662,9 @@ app.post('/dd/balanceSeed', (req, res) => {
   res.json({ ok:true, updates });
 });
 
-// Raw events SSE (optional debugging)
+// Raw events SSE
 app.get('/events/stream', (req, res) => {
   if (!checkToken(req, res)) return;
-
-  // --- Per-IP stream limiting ---
   const ip = getIp(req);
   if ((streamsByIp.get(ip) || 0) >= MAX_STREAMS_PER_IP) {
     return res.status(429).send('Too many streams from this IP');
@@ -646,9 +690,7 @@ app.get('/events/stream', (req, res) => {
     filter,
     ping: setInterval(() => {
       safeWrite(res, `: ping\n\n`).then(ok => {
-        if (!ok) {
-          try { req.destroy(); } catch {}
-        }
+        if (!ok) { try { req.destroy(); } catch {} }
       });
     }, HEARTBEAT_MS)
   };
@@ -668,19 +710,19 @@ app.get('/events/stream', (req, res) => {
 app.get('/health', (_req,res)=> {
   let totalPositions = 0;
   for (const posMap of positions.values()) totalPositions += posMap.size;
-  res.json({ ok:true, env: TYPE, knownAccounts: state.size, totalPositions });
+  res.json({ ok:true, env: TYPE, knownAccounts: state.size, totalPositions, positionStreamSubs: posSubs.size });
 });
 
 app.get('/brand/status', (_req,res)=> {
   let totalPositions = 0;
   for (const posMap of positions.values()) totalPositions += posMap.size;
-
   res.json({
     env: TYPE,
     server: SERVER,
     connected: socket.connected,
     knownAccounts: state.size,
     totalPositions,
+    positionStreamSubs: posSubs.size,
     lastBrandEventAt,
     lastConnectError,
     now: Date.now(),
